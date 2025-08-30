@@ -138,7 +138,10 @@ void MLServerUDS::OnConnected(int result) {
     return;
   }
 
-  LOG(INFO) << "OnConnected: sending the payload ";
+  LOG(INFO) << "OnConnected: sending the payload in chunks";
+
+  // reset chunk state
+  bytes_sent_ = 0;
 
   net::NetworkTrafficAnnotationTag annotation =
       net::DefineNetworkTrafficAnnotation("ml_server_uds_write", R"(
@@ -154,21 +157,58 @@ void MLServerUDS::OnConnected(int result) {
           setting: "This cannot be disabled in settings."
         })");
 
+  // kick off first chunk write
+  WriteNextChunk(annotation);
+}
+
+void MLServerUDS::WriteNextChunk(
+    const net::NetworkTrafficAnnotationTag& annotation) {
+  constexpr size_t kChunkSize = 64 * 1024; // 64 KB
+  size_t remaining = payload_size_ - bytes_sent_;
+  size_t to_send = std::min(kChunkSize, remaining);
+
+  auto buf = base::MakeRefCounted<net::IOBufferWithSize>(to_send);
+  memcpy(buf->data(), payload_->data() + bytes_sent_, to_send);
+
   int write_result =
-      socket_->Write(payload_.get(), payload_size_,
-                     base::BindOnce(&MLServerUDS::OnDataWritten,
-                                    weak_ptr_factory_.GetWeakPtr()),
+      socket_->Write(buf.get(), to_send,
+                     base::BindOnce(&MLServerUDS::OnChunkWritten,
+                                    weak_ptr_factory_.GetWeakPtr(),
+                                    buf, to_send, annotation),
                      annotation);
 
-  if (write_result == static_cast<int>(payload_->size())) {
-    LOG(INFO) << "Write synchronous";
-    OnDataWritten(write_result);
+  if (write_result == static_cast<int>(to_send)) {
+    LOG(INFO) << "Chunk write synchronous, size=" << to_send;
+    OnChunkWritten(buf, to_send, annotation, write_result);
   } else if (write_result == net::ERR_IO_PENDING) {
-    LOG(INFO) << "Write pending";
+    LOG(INFO) << "Chunk write pending, size=" << to_send;
   } else {
     LOG(ERROR) << "Write failed: " << write_result;
     content::GetUIThreadTaskRunner({})->PostTask(
         FROM_HERE, base::BindOnce(std::move(error_callback_), "Write failed"));
+  }
+}
+
+void MLServerUDS::OnChunkWritten(
+    scoped_refptr<net::IOBuffer> buf,
+    size_t expected,
+    const net::NetworkTrafficAnnotationTag& annotation,
+    int result) {
+  if (result < 0) {
+    LOG(ERROR) << "Chunk write failed: " << result;
+    content::GetUIThreadTaskRunner({})->PostTask(
+        FROM_HERE, base::BindOnce(std::move(error_callback_), "Write failed"));
+    return;
+  }
+
+  bytes_sent_ += result;
+  LOG(INFO) << "Chunk written: " << result << " bytes, total=" << bytes_sent_;
+
+  if (bytes_sent_ < payload_size_) {
+    WriteNextChunk(annotation);  // write next piece
+  } else {
+    LOG(INFO) << "All payload written (" << bytes_sent_ << " bytes)";
+    OnDataWritten(bytes_sent_);
   }
 }
 
