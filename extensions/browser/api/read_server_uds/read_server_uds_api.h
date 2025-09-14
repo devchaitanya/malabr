@@ -50,6 +50,7 @@ class ReadServerUdsSendDataFunction : public ExtensionFunction {
 
   void OnSuccess(std::string result);
   void OnError(std::string error_msg);
+  void DispatchRequest(std::string payload);
 
   std::unique_ptr<extensions::MLServerUDS> ml_server_;
   base::WeakPtrFactory<ReadServerUdsSendDataFunction> weak_ptr_factory_{this};
@@ -72,6 +73,7 @@ class ReadServerUdsLoadModelBERTFunction : public ExtensionFunction {
   // Socket handling
   void OnSuccess(std::string result);
   void OnError(std::string error_msg);
+  void DispatchRequest(std::string payload);
 
   std::unique_ptr<extensions::MLServerUDS> ml_server_;
   base::WeakPtrFactory<ReadServerUdsLoadModelBERTFunction> weak_ptr_factory_{
@@ -95,6 +97,7 @@ class ReadServerUdsInferSingleBERTFunction : public ExtensionFunction {
   // Socket handling
   void OnSuccess(std::string result);
   void OnError(std::string error_msg);
+  void DispatchRequest(std::vector<uint8_t> payload, std::string fb_file_identifier);
 
   std::unique_ptr<extensions::MLServerUDS> ml_server_;
   base::WeakPtrFactory<ReadServerUdsInferSingleBERTFunction> weak_ptr_factory_{this};

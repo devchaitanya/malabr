@@ -17,9 +17,9 @@ MLServerUDSV2::~MLServerUDSV2() {
   LOG(INFO) << "MLServerUDSV2 destroyed";
 }
 
-int MLServerUDSV2::Send(char* payload,
-                        size_t payload_size,
-                        std::string fb_file_identifier,
+int MLServerUDSV2::Send(const char* payload,
+                        const size_t payload_size,
+                        const std::string fb_file_identifier,
                         std::string& response,
                         std::string& error_msg) {
   base::FilePath path(socket_path_);

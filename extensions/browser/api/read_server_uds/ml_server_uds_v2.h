@@ -15,9 +15,9 @@ class MLServerUDSV2 {
   MLServerUDSV2(const std::string& socket_path, const std::string& label);
   ~MLServerUDSV2();
 
-  int Send(char* payload,
-           size_t payload_size,
-           std::string fb_file_identifier,
+  int Send(const char* payload,
+           const size_t payload_size,
+           const std::string fb_file_identifier,
            std::string& response,
            std::string& error_msg);
 
