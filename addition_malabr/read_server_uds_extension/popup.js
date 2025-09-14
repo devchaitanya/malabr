@@ -1,11 +1,6 @@
 import { flatbuffers } from './flatbuffers.js';
 import QAService from './qa_schema_generated.js';
 
-console.log('flatbuffers:', flatbuffers);
-console.log('QAService:', QAService);
-console.log('QAService.Payloads:', QAService.Payloads);
-console.log('QAService.Payloads.QARequest:', QAService.Payloads?.QARequest);
-
 // READ DATA
 const readDataBtnEle = document.getElementById('readDataBtn');
 const showReadDataResponseEle = document.getElementById('showReadDataResponse');
