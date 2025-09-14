@@ -6,6 +6,7 @@
 #include <string>
 
 #include "base/memory/weak_ptr.h"
+#include "extensions/browser/api/read_server_uds/ml_server_uds_v2.h"
 #include "extensions/browser/extension_function.h"
 
 namespace extensions {
@@ -27,6 +28,7 @@ class ReadServerUdsReadDataFunction : public ExtensionFunction {
   // Socket handling
   void OnSuccess(std::string result);
   void OnError(std::string error_msg);
+  void DispatchRequest(std::string payload);
 
   std::unique_ptr<extensions::MLServerUDS> ml_server_;
   base::WeakPtrFactory<ReadServerUdsReadDataFunction> weak_ptr_factory_{this};

@@ -64,15 +64,19 @@ class Server:
         self.epoll.register(conn.fileno(), select.EPOLLIN)
         self.connections[conn.fileno()] = conn
 
-    def recv_exact(self, conn: socket.socket, n: int):
-      """Read exactly n bytes from the socket."""
-      buf = b""
-      while len(buf) < n:
-          chunk = conn.recv(n - len(buf))
-          if not chunk:
-              raise ConnectionError("Socket closed unexpectedly")
-          buf += chunk
-      return buf
+    def recv_exact(self, conn: socket.socket, n: int) -> bytes:
+        """Read exactly n bytes from the socket into a preallocated buffer."""
+        buf = bytearray(n)
+        view = memoryview(buf)
+        read = 0
+        while read < n:
+            chunk = conn.recv_into(view[read:], n - read)
+            if chunk == 0:
+                raise ConnectionError(
+                    f"Socket closed unexpectedly, got {read}/{n} bytes"
+                )
+            read += chunk
+        return buf
     
     def _worker_task(self, router: Router, conn: socket.socket):
         """Worker task now reads the header and routes with the payload."""

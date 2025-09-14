@@ -1,7 +1,9 @@
 #include "extensions/browser/api/read_server_uds/read_server_uds_api.h"
 
 #include "base/json/json_writer.h"
+#include "base/task/thread_pool.h"
 #include "base/values.h"
+#include "extensions/browser/api/read_server_uds/ml_server_uds_v2.h"
 #include "extensions/common/api/read_server_uds.h"
 
 /// tmp/shared-sockets/echo_socket
@@ -32,23 +34,34 @@ ReadServerUdsReadDataFunction::~ReadServerUdsReadDataFunction() {
 ExtensionFunction::ResponseAction ReadServerUdsReadDataFunction::Run() {
   AddRef();  // async
 
-  auto ml_server = std::make_unique<extensions::MLServerUDS>(
-      kMLServerUDSPath, kReadServerUdsReadDataFunctionLable);
-
   std::string payload = "GET /data\n";
 
-  auto buffer = base::MakeRefCounted<net::StringIOBuffer>(payload);
-
-  ml_server->Send(buffer.get(), buffer->size(), "fb-read",
-                  base::BindOnce(&ReadServerUdsReadDataFunction::OnSuccess,
-                                 weak_ptr_factory_.GetWeakPtr()),
-                  base::BindOnce(&ReadServerUdsReadDataFunction::OnError,
-                                 weak_ptr_factory_.GetWeakPtr()));
-
-  // Important: hold the instance if needed
-  ml_server_ = std::move(ml_server);
-
+  base::ThreadPool::PostTask(
+      FROM_HERE, {base::MayBlock()},
+      base::BindOnce(&ReadServerUdsReadDataFunction::DispatchRequest,
+                     base::Unretained(this), std::move(payload)));
   return RespondLater();
+}
+
+void ReadServerUdsReadDataFunction::DispatchRequest(std::string payload) {
+  auto ml_server = std::make_unique<extensions::MLServerUDSV2>(
+      kMLServerUDSPath, kReadServerUdsReadDataFunctionLable);
+
+  std::string error_msg, response;
+  int result = ml_server->Send(payload.data(), payload.size(), "fb-read",
+                               response, error_msg);
+
+  if (result <= 0) {  // error
+    content::GetUIThreadTaskRunner({})->PostTask(
+        FROM_HERE,
+        base::BindOnce(&ReadServerUdsReadDataFunction::OnError,
+                       weak_ptr_factory_.GetWeakPtr(), std::move(error_msg)));
+  } else {
+    content::GetUIThreadTaskRunner({})->PostTask(
+        FROM_HERE,
+        base::BindOnce(&ReadServerUdsReadDataFunction::OnSuccess,
+                       weak_ptr_factory_.GetWeakPtr(), std::move(response)));
+  }
 }
 
 void ReadServerUdsReadDataFunction::OnSuccess(std::string result) {
@@ -215,7 +228,9 @@ ExtensionFunction::ResponseAction ReadServerUdsInferSingleBERTFunction::Run() {
 
   auto maybe_params = infer_single_bert_api::Params::Create(args());
 
-  std::string data(reinterpret_cast<const char*>(maybe_params->request.payload.data()), maybe_params->request.payload.size());
+  std::string data(
+      reinterpret_cast<const char*>(maybe_params->request.payload.data()),
+      maybe_params->request.payload.size());
   auto payload = base::MakeRefCounted<net::StringIOBuffer>(std::move(data));
 
   size_t payload_size = maybe_params->request.payload.size();
