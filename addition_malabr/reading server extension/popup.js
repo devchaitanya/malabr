@@ -1,4 +1,4 @@
-import { context, question } from './file.js';
+import { context, question } from './file3.js';
 
 const loadModelBERTButton = document.getElementById('loadModelBERT');
 const inferSingleButton = document.getElementById('inferSingleButton');
@@ -34,12 +34,12 @@ loadModelBERTButton.addEventListener('click', () => {
 
 // Single Inference.
 inferSingleButton.addEventListener('click', () => {
-  const question = questionInput.value.trim();
-  const context = contextInput.value.trim();
-  if (!question || !context) {
-    alert('Please provide both a question and a context.');
-    return;
-  }
+  // const question = questionInput.value.trim();
+  // const context = contextInput.value.trim();
+  // if (!question || !context) {
+  //   alert('Please provide both a question and a context.');
+  //   return;
+  // }
   const payload = { question: question, context: context };
   const jsonPayload = JSON.stringify(payload);
   console.log("Single inference payload:", jsonPayload);
@@ -54,8 +54,8 @@ inferSingleButton.addEventListener('click', () => {
         alert('Error: ' + parsedResponse.error);
       }
     } catch (e) {
-      console.error('Failed to parse single inference response:', e);
-      alert('Error: Failed to parse inference response');
+      // console.error('Failed to parse single inference response:', e,);
+      alert('Error: Failed to parse inference response', response);
     }
   });
 });
@@ -93,6 +93,7 @@ function inferSingleBERTAsync(args) {
   return new Promise((resolve, reject) => {
     try {
       const payload = JSON.stringify({ question, context });
+      // console.log(payload);
       chrome.readServer.inferSingleBERT(payload, (result) => {
         resolve(result);
       });
@@ -105,10 +106,12 @@ function inferSingleBERTAsync(args) {
 
 // Benchmark Inference.
 benchmarkInferenceButton.addEventListener('click', async () => {
-  // const payload = JSON.stringify({ question, context });
-  // await benchmarkWithSequential(payload, 50, 5);
+  benchmarkInferenceResultEle.textContent = "running"
+  const payload = JSON.stringify({ question, context });
+  await benchmarkWithSequential(payload, 10, 2);
   // await benchmarkBurst(payload, 50, 5);
-  await benchmarkWithConcurrency("", 1, 1, 2);
+  // await benchmarkWithConcurrency(payload, 5000, 50, 10);
+  benchmarkInferenceResultEle.textContent = "done"
 
 });
 
@@ -122,30 +125,39 @@ async function benchmarkWithConcurrency(payload, iterations, poolSize, warmup = 
   let completed = 0;
   let inFlight = 0;
   const latencies = [];
+  const benchmarkStart = performance.now();
 
   return new Promise((resolve) => {
     function launchNext() {
       // stop condition: all iterations launched and completed
       if (completed >= iterations && inFlight === 0) {
-        // Compute stats
+        const benchmarkEnd = performance.now();
+        const totalTime = (benchmarkEnd - benchmarkStart) / 1000; // in seconds
+        const throughput = iterations / totalTime;
+
+        // Compute latency stats
         latencies.sort((a, b) => a - b);
         const avg = latencies.reduce((a, b) => a + b, 0) / latencies.length;
         const median = latencies[Math.floor(latencies.length / 2)];
         const p90 = latencies[Math.floor(latencies.length * 0.9)];
         const p99 = latencies[Math.floor(latencies.length * 0.99)];
 
-        console.log(`Benchmark over ${iterations} iterations (concurrency=${poolSize}):`);
-        console.log(`Avg: ${avg.toFixed(2)} ms, Median: ${median.toFixed(2)} ms, P90: ${p90.toFixed(2)} ms, P99: ${p99.toFixed(2)} ms`);
+        // console.log(`Benchmark over ${iterations} iterations (concurrency=${poolSize}):`);
+        // console.log(`Avg: ${avg.toFixed(2)} ms, Median: ${median.toFixed(2)} ms, P90: ${p90.toFixed(2)} ms, P99: ${p99.toFixed(2)} ms`);
+        // console.log(`Throughput: ${throughput.toFixed(2)} requests/sec`);
 
         const result = `Benchmark (N=${iterations}, concurrency=${poolSize}):\n`
           + `Avg: ${avg.toFixed(2)} ms\n`
           + `Median: ${median.toFixed(2)} ms\n`
           + `P90: ${p90.toFixed(2)} ms\n`
-          + `P99: ${p99.toFixed(2)} ms`;
+          + `P99: ${p99.toFixed(2)} ms\n`
+          + `Throughput: ${throughput.toFixed(2)} req/sec`;
 
+        // singleBertInferBenchmarkIterationEle.textContent = "Iteration: " + iterations;
+        // singleBertInferBenchmarkIterationTimeEle.textContent = result;
         alert(result);
 
-        resolve(latencies);
+        resolve({ latencies, throughput, totalTime });
         return;
       }
 
@@ -175,11 +187,13 @@ async function benchmarkWithConcurrency(payload, iterations, poolSize, warmup = 
 }
 
 async function benchmarkWithSequential(payload, iterations, warmup = 10) {
+  // 🔹 Warmup phase (not measured)
   for (let i = 0; i < warmup; i++) {
     await inferSingleBERTAsync(payload);
   }
 
-  // Measurement: run a fixed number of iterations.
+  // 🔹 Measure total wall-clock time
+  const benchmarkStart = performance.now();
   let latencies = [];
 
   for (let i = 0; i < iterations; i++) {
@@ -189,59 +203,93 @@ async function benchmarkWithSequential(payload, iterations, warmup = 10) {
     latencies.push(endTime - startTime);
   }
 
-  // Compute statistics.
+  const benchmarkEnd = performance.now();
+  const durationSec = (benchmarkEnd - benchmarkStart) / 1000;
+  const throughput = iterations / durationSec;
+
+  // 🔹 Compute latency statistics
   latencies.sort((a, b) => a - b);
   const sum = latencies.reduce((acc, cur) => acc + cur, 0);
   const avg = sum / latencies.length;
   const median = latencies[Math.floor(latencies.length / 2)];
   const p90 = latencies[Math.floor(latencies.length * 0.9)];
-
-  console.log("Benchmark results HTTP:");
-  console.log(`Average latency: ${avg.toFixed(2)} ms`);
-  console.log(`Median latency: ${median.toFixed(2)} ms`);
-  console.log(`90th percentile latency: ${p90.toFixed(2)} ms`);
-  alert(result);
-}
-
-async function benchmarkBurst(payload, iterations, warmup = 10) {
-  // Warmup (not measured)
-  for (let i = 0; i < warmup; i++) {
-    await inferSingleBERTAsync(payload);
-  }
-
-  // Launch all requests in parallel
-  const startTimes = new Array(iterations);
-  const promises = [];
-
-  for (let i = 0; i < iterations; i++) {
-    startTimes[i] = performance.now();
-    promises.push(
-      inferSingleBERTAsync(payload)
-        .then(() => performance.now() - startTimes[i])
-    );
-  }
-
-  const latencies = await Promise.all(promises);
-
-  // Stats
-  latencies.sort((a, b) => a - b);
-  const avg = latencies.reduce((a, b) => a + b, 0) / latencies.length;
-  const median = latencies[Math.floor(latencies.length / 2)];
-  const p90 = latencies[Math.floor(latencies.length * 0.9)];
   const p99 = latencies[Math.floor(latencies.length * 0.99)];
 
-  console.log(`Burst benchmark over ${iterations} parallel requests:`);
-  console.log(`Avg: ${avg.toFixed(2)} ms, Median: ${median.toFixed(2)} ms, P90: ${p90.toFixed(2)} ms, P99: ${p99.toFixed(2)} ms`);
+  // 🔹 Print results
+  console.log("Benchmark results (Sequential):");
+  console.log(`Iterations: ${iterations}`);
+  console.log(`Total time: ${durationSec.toFixed(2)} sec`);
+  console.log(`Throughput: ${throughput.toFixed(2)} req/sec`);
+  console.log(`Avg latency: ${avg.toFixed(2)} ms`);
+  console.log(`Median latency: ${median.toFixed(2)} ms`);
+  console.log(`P90 latency: ${p90.toFixed(2)} ms`);
+  console.log(`P99 latency: ${p99.toFixed(2)} ms`);
 
-  const result = `Burst Benchmark (N=${iterations}):\n`
+  // 🔹 Show summary popup
+  const result = `Benchmark (N=${iterations}, Sequential):\n`
+    + `Total time: ${durationSec.toFixed(2)} sec\n`
+    + `Throughput: ${throughput.toFixed(2)} req/sec\n`
     + `Avg: ${avg.toFixed(2)} ms\n`
     + `Median: ${median.toFixed(2)} ms\n`
     + `P90: ${p90.toFixed(2)} ms\n`
     + `P99: ${p99.toFixed(2)} ms`;
 
   alert(result);
+}
 
-  return latencies;
+async function benchmarkBurst(payload, iterations, warmup = 10) {
+  // 🔹 Warmup (not measured)
+  for (let i = 0; i < warmup; i++) {
+    await inferSingleBERTAsync(payload);
+  }
+
+  // 🔹 Measure total time across all parallel requests
+  const benchmarkStart = performance.now();
+
+  const startTimes = new Array(iterations);
+  const promises = [];
+
+  for (let i = 0; i < iterations; i++) {
+    startTimes[i] = performance.now();
+    promises.push(
+      inferSingleBERTAsync(payload).then(
+        () => performance.now() - startTimes[i]
+      )
+    );
+  }
+
+  const latencies = await Promise.all(promises);
+  const benchmarkEnd = performance.now();
+  const durationSec = (benchmarkEnd - benchmarkStart) / 1000;
+  const throughput = iterations / durationSec;
+
+  // 🔹 Stats
+  latencies.sort((a, b) => a - b);
+  const avg = latencies.reduce((a, b) => a + b, 0) / latencies.length;
+  const median = latencies[Math.floor(latencies.length / 2)];
+  const p90 = latencies[Math.floor(latencies.length * 0.9)];
+  const p99 = latencies[Math.floor(latencies.length * 0.99)];
+
+  // 🔹 Print results
+  console.log(`Burst benchmark over ${iterations} parallel requests:`);
+  console.log(`Total time: ${durationSec.toFixed(2)} sec`);
+  console.log(`Throughput: ${throughput.toFixed(2)} req/sec`);
+  console.log(
+    `Avg: ${avg.toFixed(2)} ms, Median: ${median.toFixed(2)} ms, P90: ${p90.toFixed(2)} ms, P99: ${p99.toFixed(2)} ms`
+  );
+
+  const result =
+    `Burst Benchmark (N=${iterations}):\n` +
+    `Total time: ${durationSec.toFixed(2)} sec\n` +
+    `Throughput: ${throughput.toFixed(2)} req/sec\n` +
+    `Avg: ${avg.toFixed(2)} ms\n` +
+    `Median: ${median.toFixed(2)} ms\n` +
+    `P90: ${p90.toFixed(2)} ms\n` +
+    `P99: ${p99.toFixed(2)} ms`;
+
+  alert(result);
+
+  return { latencies, throughput, durationSec };
 }
 
 // Training with client-side timing

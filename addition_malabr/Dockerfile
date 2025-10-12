@@ -8,26 +8,19 @@ ENV PYTHONUNBUFFERED=1
 # Set working directory
 WORKDIR /app
 
-# Install system dependencies (optional but helps in many cases)
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    build-essential \
-    git \
-    curl \
-    && rm -rf /var/lib/apt/lists/*
-
 # Upgrade pip first
 RUN pip install --upgrade pip
 
 # Set working directory
 WORKDIR /app
-
-# Copy your Flask app code
-COPY modelserver/server.py .
 COPY modelserver/myrequirements.txt .
 
 # Install Python packages
 RUN pip install -r myrequirements.txt
 RUN pip install gunicorn
+
+# Copy your Flask app code
+COPY modelserver/server.py .
 
 # Expose the Flask app port
 EXPOSE 5000
