@@ -24,8 +24,20 @@ class MLServerUDSV2 {
   void Clear();
 
  private:
+
+  bool SendViaSharedMemory(SocketUDS& socket,
+                          const char* payload,
+                          size_t payload_size,
+                          std::string& error_msg);
+
+  bool SendFileDescriptor(SocketUDS& socket,
+                         int fd,
+                         std::string& error_msg);
+
   std::string GetHeaderPayload(size_t payload_size,
-                               std::string fb_file_identifier);
+                               std::string fb_file_identifier,
+                               bool use_shm);
+                               
   bool ReadExact(SocketUDS& socket,
                  char* buffer,
                  size_t size,

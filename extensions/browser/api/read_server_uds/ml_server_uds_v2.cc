@@ -1,6 +1,15 @@
 #include "extensions/browser/api/read_server_uds/ml_server_uds_v2.h"
 
 #include <arpa/inet.h>
+#include <sys/mman.h>
+#include <sys/socket.h>
+#include <sys/un.h>
+#include <fcntl.h>
+#include <unistd.h>
+#include <atomic>
+#include <chrono>
+#include <thread>
+#include <sstream>
 
 #include <string>
 
@@ -8,6 +17,21 @@
 #include "net/base/net_errors.h"
 
 namespace extensions {
+
+// Shared memory configuration
+// constexpr size_t SHM_THRESHOLD = 5 * 1024 * 1024;  // 5MB
+constexpr uint32_t NUM_CHUNKS = 128;
+constexpr uint32_t CHUNK_SIZE = 64 * 1024;  // 64KB
+
+// Ring buffer structure (must match Python exactly)
+struct Ring {
+    std::atomic<uint32_t> head;  // producer (client) writes
+    std::atomic<uint32_t> tail;  // consumer (server) writes
+    std::atomic<bool> done;      // producer sets when finished
+    char padding[7];  // padding for alignment
+    char chunks[NUM_CHUNKS][CHUNK_SIZE];
+};
+
 
 MLServerUDSV2::MLServerUDSV2(const std::string& socket_path,
                              const std::string& label)
@@ -34,18 +58,27 @@ int MLServerUDSV2::Send(const char* payload,
   }
   LOG(INFO) << "Socket Connected";
 
+  bool use_shm = true;
+
   // ---- 2. Send header ----
   std::string header_payload =
-      GetHeaderPayload(payload_size, fb_file_identifier);
+      GetHeaderPayload(payload_size, fb_file_identifier, use_shm);
   if (!WriteExact(socket, header_payload.data(), header_payload.size(),
                   error_msg)) {
     return -1;
   }
-  LOG(INFO) << "Header write done! " << header_payload.size();
+  LOG(INFO) << "Header write done! " << header_payload.size() 
+            << " (use_shm=" << use_shm << ")";
 
   // ---- 3. Send payload ----
-  if (!WriteExact(socket, payload, payload_size, error_msg)) {
-    return -1;
+  if(use_shm) {
+    if (!SendViaSharedMemory(socket, payload, payload_size, error_msg)) {
+      return -1;
+    }
+  } else{
+    if (!WriteExact(socket, payload, payload_size, error_msg)) {
+      return -1;
+    }
   }
   LOG(INFO) << "Payload write done! " << payload_size;
 
@@ -68,6 +101,173 @@ int MLServerUDSV2::Send(const char* payload,
   LOG(INFO) << "Response Read done! " << response;
 
   return static_cast<int>(response.size());
+}
+
+bool MLServerUDSV2::SendViaSharedMemory(SocketUDS& socket,
+                                        const char* payload,
+                                        size_t payload_size,
+                                        std::string& error_msg) {
+  // Generate unique shared memory name
+  auto now = std::chrono::system_clock::now().time_since_epoch();
+  auto millis = std::chrono::duration_cast<std::chrono::milliseconds>(now).count();
+  std::ostringstream oss;
+  oss << "/shm_ring_" << getpid() << "_" << pthread_self() << "_" << millis;
+  std::string shm_name = oss.str();
+
+  const size_t SHM_SIZE = sizeof(Ring);
+
+  // Create shared memory
+  int shm_fd = shm_open(shm_name.c_str(), O_CREAT | O_RDWR | O_EXCL, 0666);
+  if (shm_fd == -1) {
+    error_msg = "shm_open failed: " + std::string(strerror(errno));
+    LOG(ERROR) << error_msg;
+    return false;
+  }
+
+  // Set size
+  if (ftruncate(shm_fd, SHM_SIZE) == -1) {
+    error_msg = "ftruncate failed: " + std::string(strerror(errno));
+    LOG(ERROR) << error_msg;
+    close(shm_fd);
+    shm_unlink(shm_name.c_str());
+    return false;
+  }
+
+  // Map shared memory
+  void* map = mmap(nullptr, SHM_SIZE, PROT_READ | PROT_WRITE, 
+                   MAP_SHARED, shm_fd, 0);
+  if (map == MAP_FAILED) {
+    error_msg = "mmap failed: " + std::string(strerror(errno));
+    LOG(ERROR) << error_msg;
+    close(shm_fd);
+    shm_unlink(shm_name.c_str());
+    return false;
+  }
+
+  // Initialize ring buffer with placement new
+  Ring* ring = new (map) Ring();
+  ring->head.store(0, std::memory_order_relaxed);
+  ring->tail.store(0, std::memory_order_relaxed);
+  ring->done.store(false, std::memory_order_relaxed);
+
+  LOG(INFO) << "Shared memory created: " << shm_name;
+
+  // Send shared memory FD to server via SCM_RIGHTS
+  if (!SendFileDescriptor(socket, shm_fd, error_msg)) {
+    munmap(map, SHM_SIZE);
+    close(shm_fd);
+    shm_unlink(shm_name.c_str());
+    return false;
+  }
+
+  LOG(INFO) << "Shared memory FD sent to server";
+
+  // Write payload to ring buffer in chunks
+  size_t offset = 0;
+  while (offset < payload_size) {
+    uint32_t head = ring->head.load(std::memory_order_relaxed);
+    uint32_t tail = ring->tail.load(std::memory_order_acquire);
+    uint32_t next = (head + 1) % NUM_CHUNKS;
+
+    // Check if ring is full
+    if (next == tail) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+      continue;
+    }
+
+    // Calculate chunk size to write
+    size_t remaining = payload_size - offset;
+    size_t chunk_len = (remaining > CHUNK_SIZE) ? CHUNK_SIZE : remaining;
+
+    // Copy data to chunk
+    memcpy(ring->chunks[head], payload + offset, chunk_len);
+    
+    // Zero-fill remaining space in chunk if needed
+    if (chunk_len < CHUNK_SIZE) {
+      memset(ring->chunks[head] + chunk_len, 0, CHUNK_SIZE - chunk_len);
+    }
+
+    offset += chunk_len;
+
+    // Advance head
+    ring->head.store(next, std::memory_order_release);
+  }
+
+  // Signal completion
+  ring->done.store(true, std::memory_order_release);
+  
+  LOG(INFO) << "Payload written to shared memory (" << payload_size 
+            << " bytes in " << ((payload_size + CHUNK_SIZE - 1) / CHUNK_SIZE) 
+            << " chunks)";
+
+  // Wait for server to consume all data (tail catches up to head)
+  // This ensures server has read everything before we cleanup
+  auto start = std::chrono::steady_clock::now();
+  const auto timeout = std::chrono::seconds(30);
+  
+  while (true) {
+    uint32_t head = ring->head.load(std::memory_order_acquire);
+    uint32_t tail = ring->tail.load(std::memory_order_acquire);
+    
+    if (head == tail) {
+      break;  // Server consumed everything
+    }
+    
+    if (std::chrono::steady_clock::now() - start > timeout) {
+      error_msg = "Timeout waiting for server to consume shared memory";
+      LOG(ERROR) << error_msg;
+      munmap(map, SHM_SIZE);
+      close(shm_fd);
+      shm_unlink(shm_name.c_str());
+      return false;
+    }
+    
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  }
+
+  LOG(INFO) << "Server consumed all data from shared memory";
+
+  // Cleanup
+  munmap(map, SHM_SIZE);
+  close(shm_fd);
+  shm_unlink(shm_name.c_str());
+
+  return true;
+}
+
+bool MLServerUDSV2::SendFileDescriptor(SocketUDS& socket,
+                                       int fd,
+                                       std::string& error_msg) {
+  struct msghdr msg = {};
+  struct iovec iov = {};
+  char dummy = 0;
+  
+  iov.iov_base = &dummy;
+  iov.iov_len = 1;
+  
+  char ctrl_buf[CMSG_SPACE(sizeof(int))];
+  memset(ctrl_buf, 0, sizeof(ctrl_buf));
+  
+  msg.msg_iov = &iov;
+  msg.msg_iovlen = 1;
+  msg.msg_control = ctrl_buf;
+  msg.msg_controllen = sizeof(ctrl_buf);
+  
+  struct cmsghdr* cmsg = CMSG_FIRSTHDR(&msg);
+  cmsg->cmsg_level = SOL_SOCKET;
+  cmsg->cmsg_type = SCM_RIGHTS;
+  cmsg->cmsg_len = CMSG_LEN(sizeof(int));
+  memcpy(CMSG_DATA(cmsg), &fd, sizeof(int));
+  
+  int sock_fd = socket.GetRawFd();  // YOU NEED TO IMPLEMENT THIS
+  
+  if (sendmsg(sock_fd, &msg, 0) == -1) {
+    error_msg = "sendmsg failed: " + std::string(strerror(errno));
+    LOG(ERROR) << error_msg;
+    return false;
+  }
+  
+  return true;
 }
 
 bool MLServerUDSV2::WriteExact(SocketUDS& socket,
@@ -107,18 +307,16 @@ bool MLServerUDSV2::ReadExact(SocketUDS& socket,
 }
 
 std::string MLServerUDSV2::GetHeaderPayload(size_t payload_size,
-                                            std::string fb_file_identifier) {
-  // 1. Construct the header string
+                                            std::string fb_file_identifier,
+                                            bool use_shm) {
+  // Modified header format: "fb_id,label,payload_size,use_shm"
   std::string header =
-      fb_file_identifier + "," + label_ + "," + std::to_string(payload_size);
+      fb_file_identifier + "," + label_ + "," + std::to_string(payload_size) +
+      "," + (use_shm ? "1" : "0");
 
-  // 2. Compute its length
   uint32_t header_len = static_cast<uint32_t>(header.size());
-
-  // 3. Convert length to network byte order (big endian)
   uint32_t header_len_net = htonl(header_len);
 
-  // 4. Build final output: 4-byte length prefix + header
   std::string out;
   out.reserve(sizeof(header_len_net) + header.size());
   out.append(reinterpret_cast<const char*>(&header_len_net),

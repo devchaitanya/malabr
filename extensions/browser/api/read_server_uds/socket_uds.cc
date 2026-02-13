@@ -83,4 +83,6 @@ int SocketUDS::MapErrno(int e) {
       return net::ERR_FAILED;
   }
 }
+
+int SocketUDS::GetRawFd() const { return sockfd_; }
 }  // namespace extensions

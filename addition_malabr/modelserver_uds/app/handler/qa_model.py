@@ -3,11 +3,14 @@ import threading
 from transformers import pipeline
 from response import respond
 from types_defs import Payload
+from logger import get_logger
 
 from .QAService.Payloads import Root
 from .QAService.Payloads import QARequest
 from .QAService.Payloads import QAResponse
 from .QAService.Payloads import AnyPayload
+
+logger = get_logger(__name__)
 
 _qa_pipeline_lock = threading.Lock()
 _qa_pipeline = None
@@ -48,11 +51,16 @@ def infer(conn: socket.socket, payload: Payload) -> None:
             respond(conn, "error", "Model not loaded.")
             return
         try:
+            logger.info(payload['payload_bytes'])
+            logger.info("size: ", len(payload["payload_bytes"]))
+            
             question, context = parse_request(payload['payload_bytes'])
+            logger.info(f"question: {question}, context: {context}")
             
             if not question or not context:
                 raise ValueError("Missing question or context")
             result = _qa_pipeline(question=question, context=context)
             respond(conn, "ok", "Answer: " + result["answer"])
+            
         except Exception as e:
             respond(conn, "error", f"Inference failed: {e}")

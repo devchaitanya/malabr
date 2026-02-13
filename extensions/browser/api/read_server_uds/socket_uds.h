@@ -27,6 +27,8 @@ class SocketUDS {
   // Fake synchronous write (wrapped).
   int Write(const char* buf, int buf_len);
 
+  int GetRawFd() const;
+
  private:
   int sockfd_;
   std::string path_;
