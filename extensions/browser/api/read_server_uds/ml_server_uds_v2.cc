@@ -18,33 +18,45 @@
 
 namespace extensions {
 
-// Configuration
-constexpr uint32_t NUM_CHUNKS = 128;
-constexpr uint32_t CHUNK_SIZE = 64 * 1024;  // 64KB
+// Shared memory configuration
+// constexpr size_t SHM_THRESHOLD = 5 * 1024 * 1024;  // 5MB
 
-// Double ring buffer structure - ONLY structure we use
-struct DoubleRing {
-    // Ring A
-    alignas(64) std::atomic<uint32_t> head_a;
-    std::atomic<uint32_t> tail_a;
-    std::atomic<bool> done_a;
-    char padding_a[7];
-    char chunks_a[NUM_CHUNKS][CHUNK_SIZE];
-    
-    // Ring B
-    alignas(64) std::atomic<uint32_t> head_b;
-    std::atomic<uint32_t> tail_b;
-    std::atomic<bool> done_b;
-    char padding_b[7];
-    char chunks_b[NUM_CHUNKS][CHUNK_SIZE];
-    
-    // Control atomics
-    std::atomic<uint8_t> active_write_ring;  // 0=A, 1=B
-    std::atomic<uint8_t> active_read_ring;
-    std::atomic<bool> swap_requested;
-    std::atomic<bool> swap_acknowledged;
-    char control_padding[4];
+// ── CHANGED: was NUM_CHUNKS=128 / CHUNK_SIZE=64KB for a flat ring.
+//   Now: a pool of NUM_POOL_SLOTS independent buffers + a small index ring.
+//   Invariant: NUM_POOL_SLOTS >= NUM_RING_SLOTS (pool can never starve ring).
+constexpr uint32_t NUM_POOL_SLOTS = 32;          // independent payload buffers
+constexpr uint32_t SLOT_SIZE      = 64 * 1024;   // 64KB — same as old CHUNK_SIZE
+constexpr uint32_t NUM_RING_SLOTS = 16;          // index-ring capacity
+static_assert(NUM_POOL_SLOTS >= NUM_RING_SLOTS,
+              "Pool must be >= ring capacity to prevent deadlock");
+
+// ── CHANGED: was one Ring struct with embedded char chunks[][].
+//   Now PoolSlot holds the data; Ring holds only uint32_t slot indices.
+//
+// PoolSlot in_use: 0=free  1=producer-writing  2=ready-for-consumer
+// Layout: in_use(1) _pad(7) data[SLOT_SIZE]   ← must match Python exactly
+struct PoolSlot {
+    std::atomic<uint8_t> in_use;
+    char                 _pad[7];
+    char                 data[SLOT_SIZE];
 };
+static_assert(sizeof(PoolSlot) == 8 + SLOT_SIZE, "PoolSlot size mismatch");
+
+struct Pool {
+    PoolSlot slots[NUM_POOL_SLOTS];
+};
+
+// Ring layout: head(4) tail(4) done(1) padding(7) indices[NUM_RING_SLOTS]
+//              ← must match Python; indices[] must land at offset 16
+struct Ring {
+    std::atomic<uint32_t> head;  // producer (client) writes
+    std::atomic<uint32_t> tail;  // consumer (server) writes
+    std::atomic<bool>     done;  // producer sets when finished
+    char                  padding[7];
+    uint32_t              indices[NUM_RING_SLOTS];
+};
+static_assert(offsetof(Ring, indices) == 16, "Ring::indices must be at offset 16");
+
 
 MLServerUDSV2::MLServerUDSV2(const std::string& socket_path,
                              const std::string& label)
@@ -52,10 +64,6 @@ MLServerUDSV2::MLServerUDSV2(const std::string& socket_path,
 
 MLServerUDSV2::~MLServerUDSV2() {
   LOG(INFO) << "MLServerUDSV2 destroyed";
-}
-
-void MLServerUDSV2::Clear() {
-  // Cleanup if needed
 }
 
 int MLServerUDSV2::Send(const char* payload,
@@ -69,13 +77,13 @@ int MLServerUDSV2::Send(const char* payload,
   // ---- 1. Connect ----
   int result = socket.Connect();
   if (result != net::OK) {
-    error_msg = "Connect failed: " + (path.value());
+    error_msg = "Connect failed: " + std::to_string(result);
     LOG(ERROR) << error_msg;
     return result;
   }
   LOG(INFO) << "Socket Connected";
 
-  bool use_shm = true;  // Always use shared memory (pool + double ring)
+  bool use_shm = true;
 
   // ---- 2. Send header ----
   std::string header_payload =
@@ -87,9 +95,15 @@ int MLServerUDSV2::Send(const char* payload,
   LOG(INFO) << "Header write done! " << header_payload.size() 
             << " (use_shm=" << use_shm << ")";
 
-  // ---- 3. Send payload via pool + double ring ----
-  if (!SendViaSharedMemory(socket, payload, payload_size, error_msg)) {
-    return -1;
+  // ---- 3. Send payload ----
+  if(use_shm) {
+    if (!SendViaSharedMemory(socket, payload, payload_size, error_msg)) {
+      return -1;
+    }
+  } else{
+    if (!WriteExact(socket, payload, payload_size, error_msg)) {
+      return -1;
+    }
   }
   LOG(INFO) << "Payload write done! " << payload_size;
 
@@ -114,239 +128,199 @@ int MLServerUDSV2::Send(const char* payload,
   return static_cast<int>(response.size());
 }
 
+// ── ADDED: scan all pool slots; CAS the first free one (0->1) and return its index.
+uint32_t AcquirePoolSlot(Pool* pool) {
+  while (true) {
+    for (uint32_t i = 0; i < NUM_POOL_SLOTS; ++i) {
+      uint8_t expected = 0;
+      if (pool->slots[i].in_use.compare_exchange_weak(
+              expected, 1,
+              std::memory_order_acquire,
+              std::memory_order_relaxed)) {
+        return i;
+      }
+    }
+    std::this_thread::sleep_for(std::chrono::microseconds(50));
+  }
+}
+
 bool MLServerUDSV2::SendViaSharedMemory(SocketUDS& socket,
                                         const char* payload,
                                         size_t payload_size,
                                         std::string& error_msg) {
-  // Receive pool info from server
-  uint32_t info_len;
-  if (!ReadExact(socket, reinterpret_cast<char*>(&info_len), 
-                 sizeof(info_len), error_msg)) {
-    return false;
-  }
-  info_len = ntohl(info_len);
-  
-  std::string pool_info(info_len, '\0');
-  if (!ReadExact(socket, pool_info.data(), info_len, error_msg)) {
-    return false;
-  }
-  
-  // Parse: "/shm_pool_12345,7"
-  size_t comma_pos = pool_info.find(',');
-  std::string pool_name = pool_info.substr(0, comma_pos);
-  int slot_id = std::stoi(pool_info.substr(comma_pos + 1));
-  
-  LOG(INFO) << "Pool: " << pool_name << ", Slot: " << slot_id;
-  
-  // Open existing pool (created by server)
-  int pool_fd = shm_open(pool_name.c_str(), O_RDWR, 0666);
-  if (pool_fd == -1) {
+  // Generate unique shared memory name
+  auto now = std::chrono::system_clock::now().time_since_epoch();
+  auto millis = std::chrono::duration_cast<std::chrono::milliseconds>(now).count();
+  std::ostringstream oss;
+  oss << "/shm_ring_" << getpid() << "_" << pthread_self() << "_" << millis;
+  std::string shm_name = oss.str();
+
+  // ── CHANGED: SHM_SIZE = Pool + Ring (was just sizeof(Ring)).
+  const size_t SHM_SIZE = sizeof(Pool) + sizeof(Ring);
+
+  // Create shared memory
+  int shm_fd = shm_open(shm_name.c_str(), O_CREAT | O_RDWR | O_EXCL, 0666);
+  if (shm_fd == -1) {
     error_msg = "shm_open failed: " + std::string(strerror(errno));
     LOG(ERROR) << error_msg;
     return false;
   }
-  
-  // Calculate sizes
-  const size_t DOUBLE_RING_SIZE = sizeof(DoubleRing);
-  const size_t MAX_SLOTS = 64;
-  const size_t CONTROL_SIZE = 4096;
-  const size_t POOL_SIZE = CONTROL_SIZE + (MAX_SLOTS * DOUBLE_RING_SIZE);
-  
-  // Map pool
-  void* pool_map = mmap(nullptr, POOL_SIZE, PROT_READ | PROT_WRITE,
-                        MAP_SHARED, pool_fd, 0);
-  if (pool_map == MAP_FAILED) {
-    error_msg = "mmap failed: " + std::string(strerror(errno));
+
+  // Set size
+  if (ftruncate(shm_fd, SHM_SIZE) == -1) {
+    error_msg = "ftruncate failed: " + std::string(strerror(errno));
     LOG(ERROR) << error_msg;
-    close(pool_fd);
+    close(shm_fd);
+    shm_unlink(shm_name.c_str());
     return false;
   }
-  
-  // Get our double ring from the pool
-  size_t double_ring_offset = CONTROL_SIZE + (slot_id * DOUBLE_RING_SIZE);
-  DoubleRing* dr = reinterpret_cast<DoubleRing*>(
-      static_cast<char*>(pool_map) + double_ring_offset
-  );
-  
-  // Initialize both rings
-  dr->head_a.store(0, std::memory_order_relaxed);
-  dr->tail_a.store(0, std::memory_order_relaxed);
-  dr->done_a.store(false, std::memory_order_relaxed);
-  
-  dr->head_b.store(0, std::memory_order_relaxed);
-  dr->tail_b.store(0, std::memory_order_relaxed);
-  dr->done_b.store(false, std::memory_order_relaxed);
-  
-  dr->active_write_ring.store(0, std::memory_order_relaxed);
-  dr->active_read_ring.store(0, std::memory_order_relaxed);
-  dr->swap_requested.store(false, std::memory_order_relaxed);
-  dr->swap_acknowledged.store(false, std::memory_order_relaxed);
-  
-  LOG(INFO) << "Double ring initialized";
-  
-  // Write payload using double buffering
+
+  // Map shared memory
+  void* map = mmap(nullptr, SHM_SIZE, PROT_READ | PROT_WRITE, 
+                   MAP_SHARED, shm_fd, 0);
+  if (map == MAP_FAILED) {
+    error_msg = "mmap failed: " + std::string(strerror(errno));
+    LOG(ERROR) << error_msg;
+    close(shm_fd);
+    shm_unlink(shm_name.c_str());
+    return false;
+  }
+
+  // ── CHANGED: placement-new Pool at offset 0, Ring immediately after.
+  Pool* pool = new (map) Pool();
+  Ring* ring = new (static_cast<char*>(map) + sizeof(Pool)) Ring();
+
+  for (uint32_t i = 0; i < NUM_POOL_SLOTS; ++i)
+    pool->slots[i].in_use.store(0, std::memory_order_relaxed);
+  ring->head.store(0, std::memory_order_relaxed);
+  ring->tail.store(0, std::memory_order_relaxed);
+  ring->done.store(false, std::memory_order_relaxed);
+
+  LOG(INFO) << "Shared memory created: " << shm_name;
+
+  // Send shared memory FD to server via SCM_RIGHTS
+  if (!SendFileDescriptor(socket, shm_fd, error_msg)) {
+    munmap(map, SHM_SIZE);
+    close(shm_fd);
+    shm_unlink(shm_name.c_str());
+    return false;
+  }
+
+  LOG(INFO) << "Shared memory FD sent to server";
+
+  // ── CHANGED: was memcpy directly into ring->chunks[head].
+  //   Now: acquire pool slot -> write -> mark ready (1->2) -> push index to ring.
   size_t offset = 0;
-  int transfer_count = 0;
-  const size_t RING_CAPACITY = NUM_CHUNKS * CHUNK_SIZE;
-  
   while (offset < payload_size) {
-    // Get current write ring index
-    uint8_t write_idx = dr->active_write_ring.load(std::memory_order_acquire);
-    
-    // Get pointers to active ring's fields
-    std::atomic<uint32_t>* head;
-    std::atomic<uint32_t>* tail;
-    std::atomic<bool>* done;
-    char (*chunks)[CHUNK_SIZE];
-    
-    if (write_idx == 0) {
-      // Use Ring A
-      head = &dr->head_a;
-      tail = &dr->tail_a;
-      done = &dr->done_a;
-      chunks = dr->chunks_a;
-    } else {
-      // Use Ring B
-      head = &dr->head_b;
-      tail = &dr->tail_b;
-      done = &dr->done_b;
-      chunks = dr->chunks_b;
-    }
-    
-    // Calculate how much to write in this ring
+    // Step 1: acquire a free pool slot (0 -> 1).
+    uint32_t slot_idx = AcquirePoolSlot(pool);
+
+    // Step 2: copy payload chunk into the slot.
     size_t remaining = payload_size - offset;
-    size_t to_write = std::min(RING_CAPACITY, remaining);
-    
-    LOG(INFO) << "Transfer " << transfer_count << ": " << to_write 
-              << " bytes to Ring " << (char)('A' + write_idx);
-    
-    // Write to current ring
-    size_t ring_offset = 0;
-    while (ring_offset < to_write) {
-      uint32_t h = head->load(std::memory_order_relaxed);
-      uint32_t t = tail->load(std::memory_order_acquire);
-      uint32_t next = (h + 1) % NUM_CHUNKS;
-      
-      // Check if ring is full
-      if (next == t) {
-        std::this_thread::sleep_for(std::chrono::microseconds(100));
+    size_t chunk_len = (remaining > SLOT_SIZE) ? SLOT_SIZE : remaining;
+    memcpy(pool->slots[slot_idx].data, payload + offset, chunk_len);
+    if (chunk_len < SLOT_SIZE)
+      memset(pool->slots[slot_idx].data + chunk_len, 0, SLOT_SIZE - chunk_len);
+    offset += chunk_len;
+
+    // Step 3: mark slot ready for consumer (1 -> 2).
+    pool->slots[slot_idx].in_use.store(2, std::memory_order_release);
+
+    // Step 4: push slot index into ring; spin if ring full.
+    while (true) {
+      uint32_t head = ring->head.load(std::memory_order_relaxed);
+      uint32_t tail = ring->tail.load(std::memory_order_acquire);
+      uint32_t next = (head + 1) % NUM_RING_SLOTS;
+      if (next == tail) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
         continue;
       }
-      
-      // Calculate chunk size to write
-      size_t chunk_remaining = to_write - ring_offset;
-      size_t chunk_len = std::min((size_t)CHUNK_SIZE, chunk_remaining);
-      
-      // Copy data to chunk
-      memcpy(chunks[h], payload + offset + ring_offset, chunk_len);
-      
-      // Zero-fill remaining space in chunk if needed
-      if (chunk_len < CHUNK_SIZE) {
-        memset(chunks[h] + chunk_len, 0, CHUNK_SIZE - chunk_len);
-      }
-      
-      ring_offset += chunk_len;
-      
-      // Advance head
-      head->store(next, std::memory_order_release);
-    }
-    
-    offset += to_write;
-    transfer_count++;
-    
-    // Signal completion for this ring
-    done->store(true, std::memory_order_release);
-    
-    // If more data remains, swap rings
-    if (offset < payload_size) {
-      LOG(INFO) << "Requesting ring swap";
-      
-      // Request swap
-      dr->swap_requested.store(true, std::memory_order_release);
-      
-      // Wait for server acknowledgment
-      auto start = std::chrono::steady_clock::now();
-      const auto timeout = std::chrono::seconds(10);
-      
-      while (!dr->swap_acknowledged.load(std::memory_order_acquire)) {
-        if (std::chrono::steady_clock::now() - start > timeout) {
-          error_msg = "Swap timeout";
-          LOG(ERROR) << error_msg;
-          munmap(pool_map, POOL_SIZE);
-          close(pool_fd);
-          return false;
-        }
-        std::this_thread::sleep_for(std::chrono::microseconds(100));
-      }
-      
-      // Perform swap
-      uint8_t new_write_idx = 1 - write_idx;
-      dr->active_write_ring.store(new_write_idx, std::memory_order_release);
-      
-      // Reset the ring we just finished writing
-      head->store(0, std::memory_order_relaxed);
-      tail->store(0, std::memory_order_relaxed);
-      done->store(false, std::memory_order_relaxed);
-      
-      // Clear swap flags
-      dr->swap_requested.store(false, std::memory_order_release);
-      dr->swap_acknowledged.store(false, std::memory_order_release);
-      
-      LOG(INFO) << "Swapped to Ring " << (char)('A' + new_write_idx);
+      ring->indices[head] = slot_idx;
+      ring->head.store(next, std::memory_order_release);
+      break;
     }
   }
+
+  // Signal completion
+  ring->done.store(true, std::memory_order_release);
   
-  LOG(INFO) << "Transfer complete: " << transfer_count << " ring fills";
-  
-  // Wait for server to consume all data from final ring
-  uint8_t final_idx = dr->active_write_ring.load(std::memory_order_acquire);
-  
-  std::atomic<uint32_t>* final_head;
-  std::atomic<uint32_t>* final_tail;
-  
-  if (final_idx == 0) {
-    final_head = &dr->head_a;
-    final_tail = &dr->tail_a;
-  } else {
-    final_head = &dr->head_b;
-    final_tail = &dr->tail_b;
-  }
-  
+  LOG(INFO) << "Payload written to shared memory (" << payload_size 
+            << " bytes in " << ((payload_size + SLOT_SIZE - 1) / SLOT_SIZE) 
+            << " chunks)";
+
+  // ── CHANGED: wait for ring drained (head==tail) AND all pool slots free.
+  //   The extra pool check prevents cleanup while consumer still holds a slot.
   auto start = std::chrono::steady_clock::now();
   const auto timeout = std::chrono::seconds(30);
   
   while (true) {
-    uint32_t h = final_head->load(std::memory_order_acquire);
-    uint32_t t = final_tail->load(std::memory_order_acquire);
-    
-    if (h == t) {
-      break;  // Server consumed everything
+    uint32_t head = ring->head.load(std::memory_order_acquire);
+    uint32_t tail = ring->tail.load(std::memory_order_acquire);
+    if (head == tail) {
+      bool pool_clear = true;
+      for (uint32_t i = 0; i < NUM_POOL_SLOTS; ++i) {
+        if (pool->slots[i].in_use.load(std::memory_order_acquire) != 0) {
+          pool_clear = false;
+          break;
+        }
+      }
+      if (pool_clear) break;  // Server consumed everything
     }
     
     if (std::chrono::steady_clock::now() - start > timeout) {
       error_msg = "Timeout waiting for server to consume shared memory";
       LOG(ERROR) << error_msg;
-      munmap(pool_map, POOL_SIZE);
-      close(pool_fd);
+      munmap(map, SHM_SIZE);
+      close(shm_fd);
+      shm_unlink(shm_name.c_str());
       return false;
     }
     
     std::this_thread::sleep_for(std::chrono::milliseconds(10));
   }
-  
+
   LOG(INFO) << "Server consumed all data from shared memory";
-  
-  // Cleanup (pool persists on server)
-  munmap(pool_map, POOL_SIZE);
-  close(pool_fd);
-  
+
+  // Cleanup
+  munmap(map, SHM_SIZE);
+  close(shm_fd);
+  shm_unlink(shm_name.c_str());
+
   return true;
 }
 
 bool MLServerUDSV2::SendFileDescriptor(SocketUDS& socket,
                                        int fd,
                                        std::string& error_msg) {
-  // NOT USED - Pool already exists, no FD passing needed
+  struct msghdr msg = {};
+  struct iovec iov = {};
+  char dummy = 0;
+  
+  iov.iov_base = &dummy;
+  iov.iov_len = 1;
+  
+  char ctrl_buf[CMSG_SPACE(sizeof(int))];
+  memset(ctrl_buf, 0, sizeof(ctrl_buf));
+  
+  msg.msg_iov = &iov;
+  msg.msg_iovlen = 1;
+  msg.msg_control = ctrl_buf;
+  msg.msg_controllen = sizeof(ctrl_buf);
+  
+  struct cmsghdr* cmsg = CMSG_FIRSTHDR(&msg);
+  cmsg->cmsg_level = SOL_SOCKET;
+  cmsg->cmsg_type = SCM_RIGHTS;
+  cmsg->cmsg_len = CMSG_LEN(sizeof(int));
+  memcpy(CMSG_DATA(cmsg), &fd, sizeof(int));
+  
+  int sock_fd = socket.GetRawFd();  // YOU NEED TO IMPLEMENT THIS
+  
+  if (sendmsg(sock_fd, &msg, 0) == -1) {
+    error_msg = "sendmsg failed: " + std::string(strerror(errno));
+    LOG(ERROR) << error_msg;
+    return false;
+  }
+  
   return true;
 }
 
