@@ -62,7 +62,6 @@ def run_server(config=None):
 
             req = Request.GetRootAsRequest(req_payload, 0)
             print(f"Received request for route '{route}' from client '{client_id}'")
-            print(req_payload)
             payload = supervisor.route_request(req, client_id, route)
             response_buf = build_response(payload)
 

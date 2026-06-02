@@ -110,9 +110,20 @@ class BaseModel {
   }
 
   _parsePredictPayload(message) {
-    debugger
+    if (Array.isArray(message)) {
+      return message;
+    }
+
+    if (message && typeof message === "object" && Array.isArray(message.y_pred)) {
+      return message.y_pred;
+    }
+
     try {
-      const parsed = JSON.parse(message || "{}");
+      const text = String(message || "{}");
+      const jsonStart = text.indexOf("{");
+      const jsonEnd = text.lastIndexOf("}");
+      const jsonText = jsonStart >= 0 && jsonEnd > jsonStart ? text.slice(jsonStart, jsonEnd + 1) : text;
+      const parsed = JSON.parse(jsonText);
       if (Array.isArray(parsed.y_pred)) {
         return parsed.y_pred;
       }
@@ -140,24 +151,9 @@ class BaseModel {
     }
 
     if (typeof value === "string") {
-      const compact = value.replace(/\s+/g, "");
-
-      if (typeof atob === "function") {
-        try {
-          const decoded = atob(compact);
-          const bytes = new Uint8Array(decoded.length);
-          for (let index = 0; index < decoded.length; index += 1) {
-            bytes[index] = decoded.charCodeAt(index);
-          }
-          return bytes;
-        } catch (err) {
-          // Fall through to binary-string decoding below.
-        }
-      }
-
-      const bytes = new Uint8Array(compact.length);
-      for (let index = 0; index < compact.length; index += 1) {
-        bytes[index] = compact.charCodeAt(index) & 0xff;
+      const bytes = new Uint8Array(value.length);
+      for (let index = 0; index < value.length; index += 1) {
+        bytes[index] = value.charCodeAt(index) & 0xff;
       }
       return bytes;
     }
@@ -278,6 +274,18 @@ class BaseModel {
     });
   }
 
+  // python server is sending
+  // '\x0c\x00\x00\x00\x08\x00\x08\x00\x00\x00\x04\x00\x08\x00\x00\x00\x04\x00\x00\x00*\x00\x00\x00{"y_pred": [0.0, 0.0, 0.0, 1.0, 1.0, 1.0]}\x00\x00'
+
+  // MServerUDS receives:
+  // '\x0c\x00\x00\x00\x08\x00\x08\x00\x00\x00\x04\x00\x08\x00\x00\x00\x04\x00\x00\x00*\x00\x00\x00{"y_pred": [0.0, 0.0, 0.0, 1.0, 1.0, 1.0]}\x00\x00'
+
+  // js client receives:
+  // '\f\x00\x00\x00\b\x00\b\x00\x00\x00\x04\x00\b\x00\x00\x00\x04\x00\x00\x00*\x00\x00\x00{"y_pred": [0.0, 0.0, 0.0, 1.0, 1.0, 1.0]}\x00\x00'
+
+  // client receives string
+  // '\x00\x00\x00\b\x00\b\x00\x00\x00\x04\x00\b\x00\x00\x00\x04\x00\x00\x00*\x00\x00\x00{"y_pred": [0.0, 0.0, 0.0, 1.0, 1.0, 1.0]}\x00\x00'
+  
   async predict(x, clientId) {
     this._assertNotDestroyed();
     this._assertArray("x", x);
@@ -285,7 +293,6 @@ class BaseModel {
       action: ML.Action.PREDICT,
       x
     });
-    debugger
     const resp = await this.malabrPredictAsync(payload);
     return this._parsePredictPayload(resp.message());
   }
