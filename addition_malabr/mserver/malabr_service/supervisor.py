@@ -408,12 +408,12 @@ class Supervisor:
             return {"status": 1, "message": "unauthorized"}
 
         action = req.Action()
-        if action == Action.FIT:
+        if action == Action.FIT and route == "ROUTE_MALABR_FIT_API":
             return self.handle_fit(req, client_id)
-        if action == Action.PREDICT:
+        if action == Action.PREDICT and route == "ROUTE_MALABR_PREDICT_API":
             return self.handle_predict(req, client_id)
-        if action == Action.SCORE:
+        if action == Action.SCORE and route == "ROUTE_MALABR_SCORE_API":
             return self.handle_score(req, client_id)
-        if action == Action.CHECK_STATUS:
+        if action == Action.CHECK_STATUS and route == "ROUTE_MALABR_CHECK_STATUS_API":
             return self.handle_status(req, client_id)
-        return {"status": 1, "message": "Unknown action"}
+        return {"status": 1, "message": "Unknown action and route"}
