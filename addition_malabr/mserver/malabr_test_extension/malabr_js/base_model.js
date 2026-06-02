@@ -229,7 +229,7 @@ class BaseModel {
     });
   }
 
-  async check_status(clientId) {
+  async check_status() {
     this._assertNotDestroyed();
     const payload = this._buildRequest({ action: ML.Action.CHECK_STATUS });
     const resp = await this.malabrCheckStatusAsync(payload);
@@ -248,7 +248,7 @@ class BaseModel {
     });
   }
 
-  async fit(x, y, clientId) {
+  async fit(x, y) {
     this._assertNotDestroyed();
     this._assertPairedArrays(x, y);
     const payload = this._buildRequest({
@@ -273,20 +273,8 @@ class BaseModel {
       }
     });
   }
-
-  // python server is sending
-  // '\x0c\x00\x00\x00\x08\x00\x08\x00\x00\x00\x04\x00\x08\x00\x00\x00\x04\x00\x00\x00*\x00\x00\x00{"y_pred": [0.0, 0.0, 0.0, 1.0, 1.0, 1.0]}\x00\x00'
-
-  // MServerUDS receives:
-  // '\x0c\x00\x00\x00\x08\x00\x08\x00\x00\x00\x04\x00\x08\x00\x00\x00\x04\x00\x00\x00*\x00\x00\x00{"y_pred": [0.0, 0.0, 0.0, 1.0, 1.0, 1.0]}\x00\x00'
-
-  // js client receives:
-  // '\f\x00\x00\x00\b\x00\b\x00\x00\x00\x04\x00\b\x00\x00\x00\x04\x00\x00\x00*\x00\x00\x00{"y_pred": [0.0, 0.0, 0.0, 1.0, 1.0, 1.0]}\x00\x00'
-
-  // client receives string
-  // '\x00\x00\x00\b\x00\b\x00\x00\x00\x04\x00\b\x00\x00\x00\x04\x00\x00\x00*\x00\x00\x00{"y_pred": [0.0, 0.0, 0.0, 1.0, 1.0, 1.0]}\x00\x00'
   
-  async predict(x, clientId) {
+  async predict(x) {
     this._assertNotDestroyed();
     this._assertArray("x", x);
     const payload = this._buildRequest({
@@ -309,7 +297,7 @@ class BaseModel {
     });
   }
 
-  async score(x, y, clientId) {
+  async score(x, y) {
     this._assertNotDestroyed();
     this._assertPairedArrays(x, y);
     const payload = this._buildRequest({
