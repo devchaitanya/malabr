@@ -37,6 +37,17 @@ def generate_gperf(gperf_path, gperf_input, gperf_args):
         # -Wimplicit-fallthrough needs an explicit fallthrough statement,
         # so replace gperf's /*FALLTHROUGH*/ comment with the statement.
         # https://savannah.gnu.org/bugs/index.php?53029
+        # Note: gperf 3.2+ already generates [[fallthrough]] with preprocessor
+        # guards, so we only replace if it's not already present. We also
+        # remove the preprocessor-guarded [[fallthrough]] blocks from newer
+        # gperf versions to avoid duplicates and just use a simple [[fallthrough]].
+        if '[[fallthrough]]' in gperf_output:
+            # Modern gperf (3.2+) generates preprocessor-guarded fallthrough.
+            # Remove the complex preprocessor blocks and keep just one [[fallthrough]].
+            # Pattern matches the #if ... [[fallthrough]]; #elif ... __attribute__... #endif block
+            gperf_output = re.sub(
+                r'#if \(defined __cplusplus.*?\n\s*\[\[fallthrough\]\];\n#elif.*?\n\s*__attribute__.*?\n#endif\n',
+                '', gperf_output, flags=re.DOTALL)
         gperf_output = gperf_output.replace('/*FALLTHROUGH*/',
                                             '  [[fallthrough]];')
         # -Wpointer-to-int-cast warns about casting pointers to smaller ints

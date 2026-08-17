@@ -3,3 +3,6 @@ node_modules
 venv
 env
 __pycache__
+
+# Model weight artifacts (GBs, downloadable separately — never commit to git)
+models/

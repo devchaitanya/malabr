@@ -12,7 +12,7 @@ namespace extensions {
 
 class MServerUDS {
  public:
-  MServerUDS(const std::string& socket_path, const std::string& label, const std::string& extension_id);
+  MServerUDS(const std::string& socket_path, const std::string& route, const std::string& extension_id);
   ~MServerUDS();
 
   int Send(const char* payload,

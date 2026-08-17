@@ -30,7 +30,7 @@ class MSocketUDS {
  private:
   int sockfd_;
   std::string path_;
-
+  // maps raw OS errors into Chromium's error codes
   int MapErrno(int e);
 };
 }  // namespace extensions
