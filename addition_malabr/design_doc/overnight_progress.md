@@ -36,7 +36,7 @@ resume after context is summarized. UPDATE THIS FILE EVERY CYCLE.
 ## Build order (from §10a / handoff v4) — status
 
 1. [DONE] SlotAllocator + wipe-on-acquire        engine.py
-2. [ ] chat template application (§6c)
+2. [DONE] chat template application (§6c) — ChatFormatter, model-agnostic
 3. [ ] single-threaded engine loop, EOS / output cap
 4. [ ] compaction (§8) + position-shift fix (EVERY live absolute position)
 5. [ ] scheduler §9a/§9b  (round budget, aging, chunked prefill, closed loop)
@@ -68,9 +68,30 @@ then:
 
 ## OPEN ASSUMPTIONS (things the design doc did not settle; decided by me)
 
-(none yet)
+1. **§6c's incremental fragment is WRONG as written; replaced with a derived
+   delta.** The doc says subsequent turns append a hardcoded
+   `<|im_start|>{role}\n{content}<|im_end|>\n`. That is ChatML, i.e.
+   Qwen-specific, and it is also wrong for the assistant turn (turn 1 with
+   add_ass=True already leaves that block OPEN, so a fragment would duplicate
+   the header). ChatFormatter instead renders the full conversation with the
+   model's own template and takes the suffix past what is already in KV.
+   Verified on gemma-3, whose delta begins `<end_of_turn>` — the hardcoded
+   ChatML version would have silently malformed every turn after the first.
+   **Recommend correcting §6c itself.**
+2. **Stop condition uses `llama_vocab_is_eog`, not `== llama_vocab_eos`.**
+   §5b describes the EOS check as verified-correct, but eos() returns ONE token
+   while Qwen3 flags SIX as end-of-generation (gemma-3 flags 3). Comparing
+   against eos alone would miss the rest and run to the output cap.
+   **Recommend correcting §5b.**
 
 ## Cycle log
 
 - cycle 0 (start): SlotAllocator written + 15 checks passing; lock rationale
   comment corrected after measurement disproved it.
+- cycle 1: ChatFormatter + is_stop_token. Closed §6c's own stated-unverified
+  question: incremental == full render, and verified in TOKENS not just strings
+  (§6c only compared strings; BPE merges across boundaries — measured
+  tok("hell")+tok("o")=[56095,78] vs tok("hello")=[14990]). The turn split is
+  safe structurally because every delta begins on a special token, and special
+  tokens are hard BPE boundaries. Passes on Qwen3 AND gemma-3. Both negative
+  controls (corrupt _rendered, broken prefix) fire correctly.
