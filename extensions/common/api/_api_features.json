@@ -518,7 +518,7 @@
     "dependencies": ["permission:readServerUds"]
   },
   "malabr": {
-    "contexts": ["privileged_extension"],
+    "contexts": ["privileged_extension", "content_script"],
     "extension_types": ["extension"],
     "dependencies": ["permission:malabr"]
   },

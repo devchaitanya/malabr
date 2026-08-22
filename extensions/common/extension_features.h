@@ -207,6 +207,26 @@ BASE_DECLARE_FEATURE(kUseItemSnippetsAPI);
 // If enabled, use the new simpler, more efficient service worker task queue.
 BASE_DECLARE_FEATURE(kUseNewServiceWorkerTaskQueue);
 
+// MALABR: tunables for the streamed inference wire protocol.
+//
+// A FeatureParam rather than a constant for one concrete reason: changing a
+// compile-time constant in this tree costs a multi-hour Chromium rebuild.
+// This value is explicitly a placeholder until prefill latency is measured
+// (phase1_design.md section 14 lists it as an open item), so it WILL need
+// tuning -- and it must be tunable without a rebuild:
+//   --enable-features=MalabrTunables:frame_read_timeout_seconds/120
+//
+// Deliberately NOT parameterized: the frame type bytes (0/1/2) are a wire
+// contract that must match the Python server exactly -- a mismatch would
+// silently corrupt the stream -- and the max frame payload is a security
+// bound, which should not be weakenable at runtime.
+BASE_DECLARE_FEATURE(kMalabrTunables);
+
+// Per-frame recv() budget, NOT a whole-response budget. Bounds how long one
+// browser thread may block on a wedged server. The longest legitimate gap is
+// the wait for the first token, which includes unchunked prefill.
+extern const base::FeatureParam<int> kMalabrFrameReadTimeoutSeconds;
+
 }  // namespace extensions_features
 
 #endif  // EXTENSIONS_COMMON_EXTENSION_FEATURES_H_

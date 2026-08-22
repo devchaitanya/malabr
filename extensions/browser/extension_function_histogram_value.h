@@ -1968,10 +1968,11 @@ enum HistogramValue {
   READSERVERUDS_INFER_SINGLE_BERT = 1902,
 
   // MALABR
-  MALABR_FIT = 1903,
-  MALABR_SCORE = 1904,
-  MALABR_PREDICT = 1905,
-  MALABR_CHECKSTATUS = 1906,
+  DELETED_MALABR_FIT = 1903,
+  DELETED_MALABR_SCORE = 1904,
+  DELETED_MALABR_PREDICT = 1905,
+  DELETED_MALABR_CHECKSTATUS = 1906,
+  MALABR_GENERATE = 1907,
       // Last entry: Add new entries above, then run:
       // tools/metrics/histograms/update_extension_histograms.py
       ENUM_BOUNDARY

@@ -1,343 +1,218 @@
 #include "extensions/browser/api/malabr/malabr_api.h"
 
 #include <string>
+#include <utility>
 
-#include "base/json/json_writer.h"
+#include "base/functional/bind.h"
 #include "base/task/thread_pool.h"
+#include "base/unguessable_token.h"
 #include "base/values.h"
-#include "extensions/browser/api/malabr/mserver_uds.h"
+#include "components/sessions/content/session_tab_helper.h"
+#include "content/public/browser/browser_task_traits.h"
+#include "content/public/browser/browser_thread.h"
+#include "content/public/browser/render_frame_host.h"
+#include "content/public/browser/render_process_host.h"
+#include "content/public/browser/web_contents.h"
+#include "url/origin.h"
+#include "extensions/browser/event_router.h"
 #include "extensions/common/api/malabr.h"
+#include "third_party/blink/public/common/service_worker/service_worker_status_code.h"
 
 namespace extensions {
 
-constexpr char kMLServerUDSPath[] = "/tmp/malabr_v3.sck";
+namespace {
 
-// ALL route for  mserver function handler
-constexpr char kMalabrFitRoute[] = "ROUTE_MALABR_FIT_API";
-constexpr char kMalabrPredictRoute[] = "ROUTE_MALABR_PREDICT_API";
-constexpr char kMalabrScoreRoute[] = "ROUTE_MALABR_SCORE_API";
-constexpr char kMalabrCheckStatusRoute[] = "ROUTE_MALABR_CHECK_STATUS_API";
+constexpr char kMalabrGenerateRoute[] = "ROUTE_MALABR_GENERATE_API";
 
+constexpr char kOnTokenEvent[] = "malabr.onToken";
+constexpr char kOnCompleteEvent[] = "malabr.onComplete";
 
-// -------------------------
-// FIT API
-// -------------------------
-MalabrFitFunction::MalabrFitFunction() = default;
-MalabrFitFunction::~MalabrFitFunction() {
-  if (!did_respond()) {
-    LOG(ERROR) << "MalabrFitFunction function destroyed without responding";
-    Respond(Error("Function was destroyed without responding"));
-  }
-}
+}  // namespace
 
-ExtensionFunction::ResponseAction MalabrFitFunction::Run() {
-  const extensions::Extension* ext = extension();
-  auto ext_id = ext->id();
+MalabrGenerateFunction::MalabrGenerateFunction() = default;
 
-  LOG(INFO) << "MalabrFitFunction::Run() called";
-  // Validate the presence of arguments
+MalabrGenerateFunction::~MalabrGenerateFunction() = default;
+
+ExtensionFunction::ResponseAction MalabrGenerateFunction::Run() {
   EXTENSION_FUNCTION_VALIDATE(has_args());
-  namespace fit_api = extensions::api::malabr::Fit;
+  namespace generate_api = extensions::api::malabr::Generate;
+  auto params = generate_api::Params::Create(args());
+  EXTENSION_FUNCTION_VALIDATE(params);
 
-  auto maybe_params = fit_api::Params::Create(args());
+  // ---- Identity: ALL derived here, nothing from the payload (section 5) ----
+  std::string ext_id = extension_id();
 
-  auto payload = maybe_params->request.payload;
+  content::RenderFrameHost* rfh = render_frame_host();
+  if (!rfh) {
+    return RespondNow(Error("no sender frame"));
+  }
+  content::WebContents* web_contents = GetSenderWebContents();
+  if (!web_contents) {
+    return RespondNow(Error("no sender WebContents"));
+  }
 
-  LOG(INFO) << "Received payload: " << payload.data();
+  // Content scripts always run inside a real tab's frame, so this yields a
+  // real id. -1 is legitimate ("not tab-scoped", e.g. a future service-worker
+  // caller) and is treated as always-background, not as an error.
+  int tab_id = sessions::SessionTabHelper::IdForTab(web_contents).id();
 
+  // ORIGIN -- part of the session key, and a privacy boundary, not a label.
+  //
+  // Without it, a session keyed only by tab survives a cross-origin
+  // navigation: chat privately on a bank site, navigate that SAME tab to any
+  // other site, and the new page's content script inherits a session whose KV
+  // cache still holds the bank conversation. The model would answer questions
+  // about it. Browser-derived via GetLastCommittedOrigin() so a content script
+  // cannot claim an origin it does not have. See section 5g.
+  const url::Origin& frame_origin = rfh->GetLastCommittedOrigin();
+
+  // Refuse opaque origins outright. Serialize() renders EVERY opaque origin
+  // as the literal "null" (RFC 6454), so two unrelated opaque-origin
+  // documents -- sandboxed pages, data: URLs -- would collide on the key
+  // (ext, tab, "null") and SHARE a session. That is the very cross-origin
+  // leak section 5g exists to prevent, reintroduced through a serialization
+  // collision. The distinguishing nonce is not exposed, so there is no safe
+  // key to build; chatting on a data: URL is not a real use case, so reject
+  // rather than invent one (audit hole 13).
+  if (frame_origin.opaque()) {
+    return RespondNow(Error("malabr is unavailable on opaque origins"));
+  }
+  std::string origin = frame_origin.Serialize();
+
+  // SEED value only. This is visibility alone, which is NOT the same as
+  // foreground: two windows on two monitors can both report VISIBLE. The
+  // authoritative "visible AND its window is the active one" test needs
+  // BrowserList::GetLastActive(), which lives in chrome/browser/ui and is
+  // NOT reachable from extensions/browser. MalabrManager owns that check and
+  // pushes corrections over the control connection; per section 6's ordering
+  // rule this header value only seeds a session at creation and is ignored
+  // for a session that already exists. See sections 5a, 5e, 6.
+  bool foreground = rfh->GetVisibilityState() ==
+                    content::PageVisibilityState::kVisible;
+
+  // Weak/safe handles, not raw pointers: the tab may die mid-stream (6a).
+  render_frame_host_ = rfh->GetWeakDocumentPtr();
+
+  request_id_ = base::UnguessableToken::Create().ToString();
+
+  // Keep this object alive across the streaming phase. Run() responds
+  // immediately (below), which would otherwise allow destruction while frames
+  // are still arriving. Released in OnComplete().
   AddRef();
   base::ThreadPool::PostTask(
       FROM_HERE, {base::MayBlock()},
-      base::BindOnce(&MalabrFitFunction::DispatchRequest,
-                     base::Unretained(this), std::move(payload),
-                     std::move(ext_id)));
+      base::BindOnce(&MalabrGenerateFunction::DispatchRequest,
+                     base::Unretained(this), std::move(params->request.prompt),
+                     std::move(ext_id), tab_id, std::move(origin),
+                     foreground));
 
-  return RespondLater();
+  // Resolve NOW with the request id -- not when generation finishes. Tokens
+  // follow as events (section 6).
+  return RespondNow(WithArguments(request_id_));
 }
 
-void MalabrFitFunction::DispatchRequest(std::vector<uint8_t> payload, std::string extension_id) {
-
+void MalabrGenerateFunction::DispatchRequest(std::string prompt,
+                                             std::string extension_id,
+                                             int tab_id,
+                                             std::string origin,
+                                             bool foreground) {
   auto ml_server = std::make_unique<extensions::MServerUDS>(
-      kMLServerUDSPath, kMalabrFitRoute, extension_id);
+      GetMalabrSocketPath(), kMalabrGenerateRoute, extension_id);
 
-  int payload_len = payload.size();
-  char* payload_ptr = reinterpret_cast<char*>(payload.data());
+  // Each streamed frame hops to the UI thread: events must be dispatched
+  // there, and this thread must never touch a RenderFrameHost.
+  auto on_token = base::BindRepeating(
+      [](base::WeakPtr<MalabrGenerateFunction> self, const std::string& text) {
+        content::GetUIThreadTaskRunner({})->PostTask(
+            FROM_HERE,
+            base::BindOnce(
+                &MalabrGenerateFunction::OnToken,
+                self,
+                text));
+      },
+      weak_ptr_factory_.GetWeakPtr()
+    );
 
-  std::string error_msg, response;
-  int result = ml_server->Send(payload_ptr, payload_len,
-                               response, error_msg);
+  // Polled by SendStreaming once per frame, on this thread.
+  auto is_abandoned = base::BindRepeating(
+      [](std::shared_ptr<std::atomic<bool>> flag) { return flag->load(); },
+      abandoned_);
 
-  if (result <= 0) {  // error
-    content::GetUIThreadTaskRunner({})->PostTask(
-        FROM_HERE,
-        base::BindOnce(&MalabrFitFunction::OnError,
-                       weak_ptr_factory_.GetWeakPtr(), std::move(error_msg)));
-  } else {
-    content::GetUIThreadTaskRunner({})->PostTask(
-        FROM_HERE,
-        base::BindOnce(&MalabrFitFunction::OnSuccess,
-                       weak_ptr_factory_.GetWeakPtr(), std::move(response)));
-  }
+  std::string error_msg;
+  ml_server->SendStreaming(prompt, tab_id, origin, foreground, on_token,
+                           is_abandoned, error_msg);
+
+  content::GetUIThreadTaskRunner({})->PostTask(
+      FROM_HERE, base::BindOnce(&MalabrGenerateFunction::OnComplete,
+                                weak_ptr_factory_.GetWeakPtr(),
+                                std::move(error_msg)));
 }
 
-void MalabrFitFunction::OnSuccess(std::string result) {
-  LOG(INFO) << "MalabrFitFunction::OnSuccess() Received response: " << result;
-  Respond(WithArguments(base::Value(result)));
+void MalabrGenerateFunction::OnToken(std::string text) {
+  DCHECK_CURRENTLY_ON(content::BrowserThread::UI);
+
+  // The destination document is gone -- tab closed, OR the page navigated to
+  // a different document (WeakDocumentPtr nulls for both). Drop this token:
+  // no UAF, no crash.
+  //
+  // Also raise the abandon flag so the blocking thread stops reading instead
+  // of draining the whole response into nowhere. Dropping FUTURE tokens one
+  // by one would be safe but wasteful, and would still let the unseen
+  // response land in the KV cache (sections 2, 6a, 6b).
+  content::RenderFrameHost* rfh = render_frame_host_.AsRenderFrameHostIfValid();
+  if (!rfh) {
+    abandoned_->store(true);
+    return;
+  }
+
+  // The profile can shut down mid-generation, at which point ExtensionFunction
+  // nulls browser_context_ (see its OnBrowserContextShutdown). EventRouter::Get
+  // would then be handed nullptr and crash, so check before dispatching.
+  content::BrowserContext* context = browser_context();
+  if (!context) {
+    abandoned_->store(true);
+    return;
+  }
+
+  base::Value::List args;
+  args.Append(request_id_);
+  args.Append(std::move(text));
+
+  // Routed to the RenderProcessHost captured at request time -- NOT to a
+  // renderer-supplied listener filter, which event_router.cc stores verbatim
+  // and unvalidated and so must never gate delivery (section 6).
+  EventRouter::Get(context)
+      ->DispatchEventToSender(
+          rfh->GetProcess(), context,
+          mojom::HostID(mojom::HostID::HostType::kExtensions, extension_id()),
+          events::MALABR_ON_TOKEN, kOnTokenEvent, kMainThreadId,
+          blink::mojom::kInvalidServiceWorkerVersionId, std::move(args),
+          mojom::EventFilteringInfo::New());
+}
+
+void MalabrGenerateFunction::OnComplete(std::string error) {
+  DCHECK_CURRENTLY_ON(content::BrowserThread::UI);
+
+  content::RenderFrameHost* rfh = render_frame_host_.AsRenderFrameHostIfValid();
+  content::BrowserContext* context = browser_context();
+  if (rfh && context) {
+    base::Value::List args;
+    args.Append(request_id_);
+    args.Append(std::move(error));
+
+    EventRouter::Get(context)
+        ->DispatchEventToSender(
+            rfh->GetProcess(), context,
+            mojom::HostID(mojom::HostID::HostType::kExtensions,
+                          extension_id()),
+            events::MALABR_ON_COMPLETE, kOnCompleteEvent, kMainThreadId,
+            blink::mojom::kInvalidServiceWorkerVersionId, std::move(args),
+            mojom::EventFilteringInfo::New());
+  }
+
+  // Balances the AddRef() in Run(). Exactly one terminal frame per request,
+  // so this runs exactly once.
   Release();
 }
 
-void MalabrFitFunction::OnError(std::string error_msg) {
-  LOG(ERROR) << "MalabrFitFunction::OnError() Error: " << error_msg;
-  Respond(Error(error_msg));
-  Release();
-}
-
-void MalabrFitFunction::OnResponded() {
-  LOG(INFO) << "MalabrFitFunction::OnResponded() Cleaning up";
-
-  if (ml_server_) {
-    ml_server_->Clear();  // First clean up state
-    ml_server_.reset();   // Then destroy safely
-  }
-
-  // Other cleanup if needed
-}
-
-// -------------------------
-// SCORE API
-// -------------------------
-MalabrScoreFunction::MalabrScoreFunction() = default;
-MalabrScoreFunction::~MalabrScoreFunction() {
-  if (!did_respond()) {
-    LOG(ERROR) << "MalabrScoreFunction function destroyed without responding";
-    Respond(Error("Function was destroyed without responding"));
-  }
-}
-
-ExtensionFunction::ResponseAction MalabrScoreFunction::Run() {
-  const extensions::Extension* ext = extension();
-  auto ext_id = ext->id();
-
-  LOG(INFO) << "MalabrScoreFunction::Run() called";
-  // Validate the presence of arguments
-  EXTENSION_FUNCTION_VALIDATE(has_args());
-  namespace score_api = extensions::api::malabr::Score;
-
-  auto maybe_params = score_api::Params::Create(args());
-
-  auto payload = maybe_params->request.payload;
-
-  AddRef();
-  base::ThreadPool::PostTask(
-      FROM_HERE, {base::MayBlock()},
-      base::BindOnce(&MalabrScoreFunction::DispatchRequest,
-                     base::Unretained(this), std::move(payload),
-                     std::move(ext_id)));
-
-  return RespondLater();
-}
-
-void MalabrScoreFunction::DispatchRequest(std::vector<uint8_t> payload,
-                                          std::string extension_id) {
-  auto ml_server = std::make_unique<extensions::MServerUDS>(
-      kMLServerUDSPath, kMalabrScoreRoute, extension_id);
-
-  int payload_len = payload.size();
-  char* payload_ptr = reinterpret_cast<char*>(payload.data());
-
-  std::string error_msg, response;
-  int result = ml_server->Send(payload_ptr, payload_len,
-                               response, error_msg);
-
-  if (result <= 0) {  // error
-    content::GetUIThreadTaskRunner({})->PostTask(
-        FROM_HERE,
-        base::BindOnce(&MalabrScoreFunction::OnError,
-                       weak_ptr_factory_.GetWeakPtr(), std::move(error_msg)));
-  } else {
-    content::GetUIThreadTaskRunner({})->PostTask(
-        FROM_HERE,
-        base::BindOnce(&MalabrScoreFunction::OnSuccess,
-                       weak_ptr_factory_.GetWeakPtr(), std::move(response)));
-  }
-}
-
-void MalabrScoreFunction::OnSuccess(std::string result) {
-  Respond(WithArguments(base::Value(result)));
-  Release();
-}
-
-void MalabrScoreFunction::OnError(std::string error_msg) {
-  Respond(Error(error_msg));
-  Release();
-}
-
-void MalabrScoreFunction::OnResponded() {
-  LOG(INFO) << "MalabrScoreFunction::OnResponded() Cleaning up";
-
-  if (ml_server_) {
-    ml_server_->Clear();  // First clean up state
-    ml_server_.reset();   // Then destroy safely
-  }
-
-  // Other cleanup if needed
-}
-
-// -------------------------
-// PREDICT API
-// -------------------------
-MalabrPredictFunction::MalabrPredictFunction() = default;
-MalabrPredictFunction::~MalabrPredictFunction() {
-  if (!did_respond()) {
-    LOG(ERROR) << "MalabrPredictFunction function destroyed without responding";
-    Respond(Error("Function was destroyed without responding"));
-  }
-}
-
-ExtensionFunction::ResponseAction MalabrPredictFunction::Run() {
-  const extensions::Extension* ext = extension();
-  auto ext_id = ext->id();
-
-  LOG(INFO) << "MalabrPredictFunction::Run() called";
-  // Validate the presence of arguments
-  EXTENSION_FUNCTION_VALIDATE(has_args());
-  namespace predict_api = extensions::api::malabr::Predict;
-
-  auto maybe_params = predict_api::Params::Create(args());
-
-  auto payload = maybe_params->request.payload;
-
-  AddRef();
-  base::ThreadPool::PostTask(
-      FROM_HERE, {base::MayBlock()},
-      base::BindOnce(&MalabrPredictFunction::DispatchRequest,
-                     base::Unretained(this), std::move(payload), std::move(ext_id)));
-
-  return RespondLater();
-}
-
-void MalabrPredictFunction::DispatchRequest(std::vector<uint8_t> payload,
-                                            std::string extension_id) {
-  auto ml_server = std::make_unique<extensions::MServerUDS>(
-      kMLServerUDSPath, kMalabrPredictRoute, extension_id);
-
-  int payload_len = payload.size();
-  char* payload_ptr = reinterpret_cast<char*>(payload.data());
-
-  std::string error_msg, response;
-  int result = ml_server->Send(payload_ptr, payload_len,
-                               response, error_msg);
-
-  if (result <= 0) {  // error
-    content::GetUIThreadTaskRunner({})->PostTask(
-        FROM_HERE,
-        base::BindOnce(&MalabrPredictFunction::OnError,
-                       weak_ptr_factory_.GetWeakPtr(), std::move(error_msg)));
-  } else {
-    content::GetUIThreadTaskRunner({})->PostTask(
-        FROM_HERE,
-        base::BindOnce(&MalabrPredictFunction::OnSuccess,
-                       weak_ptr_factory_.GetWeakPtr(), std::move(response)));
-  }
-}
-
-void MalabrPredictFunction::OnSuccess(std::string result) {
-  Respond(WithArguments(base::Value(result)));
-  Release();
-}
-
-void MalabrPredictFunction::OnError(std::string error_msg) {
-  Respond(Error(error_msg));
-  Release();
-}
-
-void MalabrPredictFunction::OnResponded() {
-  LOG(INFO) << "MalabrPredictFunction::OnResponded() Cleaning up";
-
-  if (ml_server_) {
-    ml_server_->Clear();  // First clean up state
-    ml_server_.reset();   // Then destroy safely
-  }
-
-  // Other cleanup if needed
-}
-
-// -------------------------
-// CHECKSTATUS API
-// -------------------------
-MalabrCheckStatusFunction::MalabrCheckStatusFunction() = default;
-MalabrCheckStatusFunction::~MalabrCheckStatusFunction() {
-  if (!did_respond()) {
-    LOG(ERROR) << "MalabrCheckStatusFunction function destroyed without responding";
-    Respond(Error("Function was destroyed without responding"));
-  }
-}
-
-ExtensionFunction::ResponseAction MalabrCheckStatusFunction::Run() {
-  const extensions::Extension* ext = extension();
-  auto ext_id = ext->id();
-
-  LOG(INFO) << "MalabrCheckStatusFunction::Run() called";
-  // Validate the presence of arguments
-  EXTENSION_FUNCTION_VALIDATE(has_args());
-  namespace checkstatus_api = extensions::api::malabr::CheckStatus;
-
-  auto maybe_params = checkstatus_api::Params::Create(args());
-
-  auto payload = maybe_params->request.payload;
-
-  AddRef();
-  base::ThreadPool::PostTask(
-      FROM_HERE, {base::MayBlock()},
-      base::BindOnce(&MalabrCheckStatusFunction::DispatchRequest,
-                     base::Unretained(this), std::move(payload), std::move(ext_id)));
-
-  return RespondLater();
-}
-
-void MalabrCheckStatusFunction::DispatchRequest(std::vector<uint8_t> payload,
-                                                std::string extension_id) {
-  auto ml_server = std::make_unique<extensions::MServerUDS>(
-      kMLServerUDSPath, kMalabrCheckStatusRoute, extension_id);
-
-  int payload_len = payload.size();
-  char* payload_ptr = reinterpret_cast<char*>(payload.data());
-
-  std::string error_msg, response;
-  int result = ml_server->Send(payload_ptr, payload_len,
-                               response, error_msg);
-
-  if (result <= 0) {  // error
-    content::GetUIThreadTaskRunner({})->PostTask(
-        FROM_HERE,
-        base::BindOnce(&MalabrCheckStatusFunction::OnError,
-                       weak_ptr_factory_.GetWeakPtr(), std::move(error_msg)));
-  } else {
-    content::GetUIThreadTaskRunner({})->PostTask(
-        FROM_HERE,
-        base::BindOnce(&MalabrCheckStatusFunction::OnSuccess,
-                       weak_ptr_factory_.GetWeakPtr(), std::move(response)));
-  }
-}
-
-void MalabrCheckStatusFunction::OnSuccess(std::string result) {
-  Respond(WithArguments(base::Value(result)));
-  Release();
-}
-
-void MalabrCheckStatusFunction::OnError(std::string error_msg) {
-  Respond(Error(error_msg));
-  Release();
-}
-
-void MalabrCheckStatusFunction::OnResponded() {
-  LOG(INFO) << "MalabrCheckStatusFunction::OnResponded() Cleaning up";
-
-  if (ml_server_) {
-    ml_server_->Clear();  // First clean up state
-    ml_server_.reset();   // Then destroy safely
-  }
-
-  // Other cleanup if needed
-}
 }  // namespace extensions

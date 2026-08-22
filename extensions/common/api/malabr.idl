@@ -3,34 +3,44 @@
 // found in the LICENSE file.
 
 // This IDL defines the `malabr` API for interacting with malabr_server.
+//
+// MALABR Phase 1 is LLM chat inference. The v3.0 sklearn train/predict API
+// (fit/score/predict/checkStatus) was removed here -- see git history if it
+// is ever needed. It is dead for this direction: phase1_design.md section 4
+// records storage.py is unused on this path, and section 7 records
+// trainer_workers -> 0 (sklearn is gone).
 
 namespace malabr {
 
-  dictionary FitRequest {
-    ArrayBuffer payload;
+  // The caller supplies ONLY the prompt. tab_id and visibility are derived in
+  // the browser process (malabr_api.cc) and are deliberately NOT fields here
+  // -- a content script must not be able to assert which tab it is, or that
+  // it is foreground, to steal scheduling priority.
+  // See phase1_design.md sections 5 and 5a.
+  dictionary GenerateRequest {
+    DOMString prompt;
   };
 
-  dictionary ScoreRequest {
-    ArrayBuffer payload;
-  };
-  
-  dictionary PredictRequest {
-    ArrayBuffer payload;
-  };
-
-  dictionary CheckStatusRequest {
-    ArrayBuffer payload;
-  };
-
-  callback FitCallback = void(DOMString response);
-  callback ScoreCallback = void(DOMString response);
-  callback PredictCallback = void(DOMString response);
-  callback CheckStatusCallback = void(DOMString response);
+  // Resolves with the request id once generation has been ACCEPTED (not when
+  // it finishes). Tokens then arrive asynchronously on onToken, terminated by
+  // exactly one onComplete. Streaming is why this is not a plain callback:
+  // time-to-first-token is the metric Phase 2 needs (phase1_design.md 6).
+  callback GenerateCallback = void(DOMString requestId);
 
   interface Functions {
-    static void fit(FitRequest request, optional FitCallback callback);
-    static void score(ScoreRequest request, optional ScoreCallback callback);
-    static void predict(PredictRequest request, optional PredictCallback callback);
-    static void checkStatus(CheckStatusRequest request, optional CheckStatusCallback callback);
+    static void generate(GenerateRequest request, optional GenerateCallback callback);
+  };
+
+  interface Events {
+    // One per streamed token chunk (wire frame type 0).
+    // requestId matches what generate()'s callback resolved with, so a client
+    // with several turns in flight knows which chat bubble a token belongs to.
+    static void onToken(DOMString requestId, DOMString text);
+
+    // Exactly one terminal event per request (wire frame type 1 or 2).
+    // `error` is empty on normal completion. "finished" and "failed partway"
+    // must be distinguishable once a generation can hit a budget, be
+    // cancelled, or be superseded (phase1_design.md 6, 6b).
+    static void onComplete(DOMString requestId, DOMString error);
   };
 };

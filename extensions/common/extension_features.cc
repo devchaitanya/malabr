@@ -175,4 +175,13 @@ BASE_FEATURE(kUseNewServiceWorkerTaskQueue,
              "UseNewServiceWorkerTaskQueue",
              base::FEATURE_DISABLED_BY_DEFAULT);
 
+BASE_FEATURE(kMalabrTunables,
+             "MalabrTunables",
+             base::FEATURE_ENABLED_BY_DEFAULT);
+
+const base::FeatureParam<int> kMalabrFrameReadTimeoutSeconds(
+    &kMalabrTunables,
+    /*name=*/"frame_read_timeout_seconds",
+    /*default_value=*/60);
+
 }  // namespace extensions_features
