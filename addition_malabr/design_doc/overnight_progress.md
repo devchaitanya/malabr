@@ -78,7 +78,23 @@ then:
    Verified on gemma-3, whose delta begins `<end_of_turn>` — the hardcoded
    ChatML version would have silently malformed every turn after the first.
    **Recommend correcting §6c itself.**
-2. **Stop condition uses `llama_vocab_is_eog`, not `== llama_vocab_eos`.**
+2. **SlotAllocator must NOT touch the model from a connection thread — §7 is
+   self-contradictory here.** §7's sketch has `acquire()` call
+   `llama_memory_seq_rm`, while §7's own concurrency note says connection
+   threads create sessions concurrently, and §7 separately names
+   single-threadedness a load-bearing invariant. Those cannot all hold.
+   `llama.h` states "The API is thread-safe" EXACTLY ONCE, scoped to the
+   Tokenization section (line 1131); the Memory section (line 711) has no such
+   guarantee. Wiping KV from a connection thread while the engine thread is
+   inside `llama_decode()` is an undocumented data race whose symptom is
+   corrupted KV — silently wrong output, not a crash.
+   FIX APPLIED: acquire()/release() are now pure bookkeeping (any thread);
+   `prepare(slot)` does the wipe and is ENGINE THREAD ONLY; `assert_ready(slot)`
+   guards the decode path so a missed wipe is a loud error instead of a leak.
+   The release-side "belt and braces" wipe was DROPPED — it would have to run on
+   a connection thread, and wipe-on-acquire exists precisely because release
+   cannot be trusted. **Recommend correcting §7.**
+3. **Stop condition uses `llama_vocab_is_eog`, not `== llama_vocab_eos`.**
    §5b describes the EOS check as verified-correct, but eos() returns ONE token
    while Qwen3 flags SIX as end-of-generation (gemma-3 flags 3). Comparing
    against eos alone would miss the rest and run to the output cap.
@@ -88,6 +104,12 @@ then:
 
 - cycle 0 (start): SlotAllocator written + 15 checks passing; lock rationale
   comment corrected after measurement disproved it.
+- cycle 2 (audit): found a REAL hole in both my code and §7 — the slot wipe ran
+  on connection threads, racing llama_decode on the engine thread. llama.h
+  guarantees thread-safety only for tokenization. Restructured into
+  acquire/release (bookkeeping, any thread) + prepare (engine thread) +
+  assert_ready (decode guard). 17 checks pass incl. a negative control proving
+  the guard test detects a stripped guard.
 - cycle 1: ChatFormatter + is_stop_token. Closed §6c's own stated-unverified
   question: incremental == full render, and verified in TOKENS not just strings
   (§6c only compared strings; BPE merges across boundaries — measured
