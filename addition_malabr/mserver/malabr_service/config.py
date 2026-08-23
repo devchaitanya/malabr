@@ -151,11 +151,16 @@ class ServerConfig:
 
 
 def load_config(base_dir=None):
+    # root is the mserver/ package dir; models live one level up beside it, in
+    # addition_malabr/models. Deriving model_dir from `root` put it in
+    # mserver/models, where nothing is -- calibration fell straight through to
+    # its Phase E fallback and reported a conservative curve as if measured.
     root = base_dir or os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     n_seq_max = int(os.getenv("MALABR_N_SEQ_MAX", DEFAULT_N_SEQ_MAX))
 
     env_ctx = os.getenv("MALABR_N_CTX")
-    model_dir = os.path.join(root, "models")
+    model_dir = os.getenv("MALABR_MODEL_DIR",
+                          os.path.join(os.path.dirname(root), "models"))
     model_path = os.getenv("MALABR_MODEL_PATH",
                            os.path.join(model_dir, "Qwen3-0.6B-Q8_0.gguf"))
     try:

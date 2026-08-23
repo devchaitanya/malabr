@@ -28,8 +28,8 @@ then:
 6. [DONE] protocol.py — 6-field header, frames, payload bound, control msgs
 7. [DONE] runtime.py — control route, reader thread, PID lock
 8. [DONE] config.py — startup-computed n_ctx/n_threads, calibration path
-9. [ ] calibration.py — §11a phases A–G + Phase B-prefill
-10.[ ] gut supervisor.py; DELETE training.py, storage.py
+9. [DONE] calibration.py — §11a phases A–G + Phase B-prefill
+10.[DONE] deleted supervisor.py/training.py/storage.py; wrote real app.py
 11.[ ] §12 harness (31 numbered tests)
 
 ## Verified facts from measurement
@@ -179,3 +179,32 @@ then:
     model_bytes)`, capped at §7's 16384. That lands on exactly 2048
     tokens/session on reference hardware and degrades sensibly on smaller
     machines (2 GB -> 4096 floor, 4 GB -> 6880). **Recommend correcting §11.**
+
+## First real measurements of the assembled engine
+
+Qwen3-0.6B-Q8_0, n_ctx 4096, n_seq_max 4, n_threads 3 (quota-matched), 4
+physical cores. Full calibration takes ~43s; it is cached to disk afterwards.
+
+    Phase A  threads   1 -> 18.3, 2 -> 33.2, 4 -> 46.8 tok/s
+                       fastest is 4, quota caps at 3, so 3 is chosen
+    Phase B  decode    pos   32 -> 46.1 tok/s (median), 45.1 (worst)
+                       pos  256 -> 37.1 / 31.5   <- 15% spread
+                       pos  960 -> 29.0 / 27.0
+    Phase B-prefill    depth  32 -> 279 tok/s
+                       depth 512 -> 195 tok/s
+    Phase C  joint     4 sessions @ depth 512, batched:
+                       64.4 tok/s aggregate, 16.1 each
+
+Three things worth recording:
+
+- **Prefill is ~6x decode, not the order of magnitude §9b assumed.** 279 vs
+  46 tok/s at depth 32. §14 recorded prefill as entirely unmeasured; this is
+  the first number. Same direction as predicted, smaller factor.
+- **Phase C does not contradict the document's 12.5 tok/s figure, it
+  complements it.** At depth 512 batching gives 64.4 aggregate against 31.6
+  solo — a 2x benefit. The document's measurement at depth 1500 gave 12.5
+  aggregate against 25.1 solo, i.e. batching *hurt*. Both fit "batching stops
+  paying once sessions are deep"; this is the shallow end of that curve.
+- **The measured trial spread (1–15%) justifies the median/worst split.** At
+  pos 256 the spread was 15%, so a round admitted on the median estimate there
+  really could overrun its budget.
