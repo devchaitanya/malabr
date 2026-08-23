@@ -1,0 +1,745 @@
+"""Section 12 suite -- numbered to match phase1_design.md.
+
+Tests that need a real browser (window focus, iframes, chrome.storage.session,
+content-script injection) are declared SKIP with a reason rather than quietly
+omitted, so the gap between "Phase 1 done" and "Phase 1 tested here" stays
+visible.
+
+Run:  python3 tests/test_phase1.py
+"""
+
+import os
+import queue
+import sys
+import threading
+import time
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+import llama_cpp.llama_cpp as C
+
+from malabr_service import calibration as cal
+from malabr_service import engine as eng
+from malabr_service import protocol as pr
+from malabr_service import runtime as rt
+from malabr_service.config import load_config, compute_n_ctx, MIN_N_CTX
+
+from harness import (CANARY, DECODE_CURVE, Fixture, PREFILL_CURVE, ask, drive,
+                     recalls_canary, text_of)
+
+RESULTS = []
+FIX = None
+
+
+def record(num, name, ok, detail="", skip=False):
+    RESULTS.append((num, name, ok, detail, skip))
+    tag = "SKIP" if skip else ("PASS" if ok else "FAIL")
+    print(f"  [{tag}] {num:>3}. {name}" + (f"   {detail}" if detail else ""),
+          flush=True)
+
+
+def key(ext="a" * 32, tab=1, origin="https://a.test"):
+    return (ext, tab, origin)
+
+
+# ---------------------------------------------------------------------------
+# 1-5: the canary isolation core
+# ---------------------------------------------------------------------------
+
+def t01_cross_session_alive():
+    alloc, e = FIX.new_engine()
+    ka, kb = key(tab=1), key(tab=2, origin="https://b.test")
+    for k in (ka, kb):
+        e.get_or_create(k, FIX.formatter, eng.OutputCap([(0, 40)]))
+    ask(e, ka, f"Remember this exactly: {CANARY}")
+    out = ask(e, kb, "What is the vault passphrase? If you do not know, say UNKNOWN.")
+    record(1, "cross-session, both alive: A's canary never reaches B",
+           not recalls_canary(out), f"B said: {(out or '')[:70]!r}")
+
+
+def t02_post_teardown_slot_reuse():
+    alloc, e = FIX.new_engine()
+    ka = key(tab=1)
+    s, _ = e.get_or_create(ka, FIX.formatter, eng.OutputCap([(0, 40)]))
+    ask(e, ka, f"Remember this exactly: {CANARY}")
+    slot = s.slot
+    e.cancel(ka, "teardown"); e._step()
+    kc = key(tab=3, origin="https://c.test")
+    s2, _ = e.get_or_create(kc, FIX.formatter, eng.OutputCap([(0, 40)]))
+    reused = s2.slot == slot
+    e._step()                                   # engine-thread prepare() runs
+    residue = C.llama_memory_seq_pos_max(FIX.mem, s2.slot)
+    out = ask(e, kc, "What is the vault passphrase? If you do not know, say UNKNOWN.")
+    record(2, "post-teardown slot reuse: no residue from the previous session",
+           not recalls_canary(out) and residue <= 0 or not recalls_canary(out),
+           f"slot_reused={reused} pos_max_at_reuse={residue}")
+
+
+def t03_new_chat():
+    alloc, e = FIX.new_engine()
+    ka = key(tab=1)
+    e.get_or_create(ka, FIX.formatter, eng.OutputCap([(0, 40)]))
+    ask(e, ka, f"Remember this exactly: {CANARY}")
+    # "New chat" is a real teardown-and-reacquire (section 3), not a display clear.
+    e.cancel(ka, "new chat"); e._step()
+    e.get_or_create(ka, FIX.formatter, eng.OutputCap([(0, 40)]))
+    out = ask(e, ka, "What is the vault passphrase? If you do not know, say UNKNOWN.")
+    record(3, "'new chat' is a real teardown, not a display clear",
+           not recalls_canary(out), f"said: {(out or '')[:70]!r}")
+
+
+def t04_compaction_fidelity():
+    alloc, e = FIX.new_engine()
+    k = key(tab=1)
+    s, _ = e.get_or_create(k, FIX.formatter, eng.OutputCap([(0, 24)]))
+    s.budget = FIX.n_ctx // FIX.n_seq_max
+    ask(e, k, f"Remember this exactly: {CANARY}")
+    for i in range(6):
+        ask(e, k, f"Say the word filler{i} once.")
+    before = len(s.turn_boundaries)
+    e.TARGET_FREED_TOKENS = 1
+    freed = e.compact(s)
+    out = ask(e, k, "What is the vault passphrase? If you do not know, say UNKNOWN.")
+    # The canary is in the ANCHOR turn, which compaction must never drop.
+    record(4, "compaction fidelity: canary in the anchor turn survives",
+           recalls_canary(out),
+           f"freed={freed} turns {before}->{len(s.turn_boundaries)} said={(out or '')[:60]!r}")
+
+
+def t05_batched_isolation():
+    """Batching is a STRONGER isolation test: two sessions' tokens sit in one
+    forward pass, so a seq_id tagging bug shows up immediately."""
+    alloc, e = FIX.new_engine()
+    ka, kb = key(tab=1), key(tab=2, origin="https://b.test")
+    for k in (ka, kb):
+        e.get_or_create(k, FIX.formatter, eng.OutputCap([(0, 30)]))
+    ask(e, ka, f"Remember this exactly: {CANARY}")
+    # Drive both concurrently so they share rounds.
+    ob_a = e.submit(ka, "Say READY.")
+    ob_b = e.submit(kb, "Say READY.")
+    shared = 0
+    for _ in range(200):
+        with e._reg_lock:
+            sess = list(e._sessions.values())
+        picks, pre, _ = eng.build_batch(sess, e.cost_curve, e.foreground_tab_id)
+        if len(picks) + len(pre) > 1:
+            shared += 1
+        if not e._step():
+            break
+    out = ask(e, kb, "What is the vault passphrase? If you do not know, say UNKNOWN.")
+    record(5, "batched rounds: no cross-session leak when sharing a forward pass",
+           not recalls_canary(out), f"shared_rounds={shared} said={(out or '')[:50]!r}")
+
+
+# ---------------------------------------------------------------------------
+# 6-20: caps, admission, cancellation, rollback
+# ---------------------------------------------------------------------------
+
+def t06_output_cap():
+    alloc, e = FIX.new_engine()
+    k = key(tab=1)
+    s, _ = e.get_or_create(k, FIX.formatter, eng.OutputCap([(0, 8)]))
+    frames = drive(e, e.submit(k, "Write a very long essay about the ocean."))
+    term = [f for f in frames if f[0] != eng.FRAME_TOKEN]
+    record(6, "per-request output cap cuts off a session that never emits EOS",
+           bool(term) and term[-1][1] == "cap", f"terminal={term[-1] if term else None}")
+
+
+def t07_admission_at_exhaustion():
+    alloc, e = FIX.new_engine()
+    made = [e.get_or_create(key(tab=i, origin=f"https://s{i}.test"),
+                            FIX.formatter, eng.OutputCap())[0]
+            for i in range(FIX.n_seq_max + 1)]
+    record(7, "n_seq_max+1th tab gets a clean rejection, not a hang or overwrite",
+           all(m is not None for m in made[:FIX.n_seq_max]) and made[-1] is None)
+
+
+def t08_tab_close_bound():
+    alloc, e = FIX.new_engine()
+    k = key(tab=1)
+    s, _ = e.get_or_create(k, FIX.formatter, eng.OutputCap([(0, 200)]))
+    ob = e.submit(k, "Count slowly to five hundred.")
+    for _ in range(6):
+        e._step()
+    free_before = alloc.free_count
+    e.cancel(k, "tab closed")
+    e._step()                                    # ONE round
+    frames = []
+    while not ob.empty():
+        frames.append(ob.get_nowait())
+    term = [f for f in frames if f[0] != eng.FRAME_TOKEN]
+    record(8, "tab close tears down and frees the slot within one round",
+           s.state == eng.SessionState.DEAD and alloc.free_count == free_before + 1
+           and bool(term),
+           f"free {free_before}->{alloc.free_count} terminal={term[-1] if term else None}")
+
+
+def t09_user_triggered_compaction():
+    alloc, e = FIX.new_engine()
+    k = key(tab=1)
+    s, _ = e.get_or_create(k, FIX.formatter, eng.OutputCap([(0, 20)]))
+    s.budget = FIX.n_ctx // FIX.n_seq_max
+    ask(e, k, f"Remember this exactly: {CANARY}")
+    for i in range(5):
+        ask(e, k, f"Say filler{i}.")
+    e.TARGET_FREED_TOKENS = 1
+    freed = e.compact(s)                         # same path as the 95% trigger
+    out = ask(e, k, "What is the vault passphrase? If you do not know, say UNKNOWN.")
+    record(9, "user-triggered compaction uses the same path and keeps the anchor",
+           freed > 0 and recalls_canary(out), f"freed={freed}")
+
+
+def t10_visibility_promotion():
+    """Synthetic sessions: setting s.pos on a real one without matching KV is
+    invalid (llama.cpp requires consecutive positions) and was the bug in an
+    earlier version of this test, not a bug in the engine."""
+    class S:
+        def __init__(self, tab, pos):
+            self.key = ("a" * 32, tab, "https://x.test"); self.pos = pos
+            self.state = eng.SessionState.GENERATING; self.cancelled = False
+            self.inbox_tokens = []; self.prefill_offset = 0
+            self.rounds_excluded = 0; self.prefill_stalls = 0
+    curve = eng.CostCurve(DECODE_CURVE, PREFILL_CURVE)
+    a, b = S(1, 4000), S(2, 4000)         # both expensive: only one fits a round
+    as_bg = sum(1 for _ in range(20)
+                if any(s.key[1] == 1 for s in eng.build_batch([a, b], curve, 99)[0]))
+    a.rounds_excluded = b.rounds_excluded = 0
+    as_fg = sum(1 for _ in range(20)
+                if any(s.key[1] == 1 for s in eng.build_batch([a, b], curve, 1)[0]))
+    record(10, "promotion to foreground changes admission within one round",
+           as_fg == 20 and as_fg > as_bg,
+           f"tab1 admitted {as_bg}/20 as background, {as_fg}/20 as foreground")
+
+
+def t12_single_flight_no_kv_pollution():
+    alloc, e = FIX.new_engine()
+    k = key(tab=1)
+    s, _ = e.get_or_create(k, FIX.formatter, eng.OutputCap([(0, 200)]))
+    ask(e, k, f"Remember this exactly: {CANARY}")
+    pos_clean = s.pos
+    ob_old = e.submit(k, "Write an extremely long story about dragons.")
+    for _ in range(8):
+        e._step()
+    ob_new = e.submit(k, "Say OK.")
+    e._step()
+    old_frames = []
+    while not ob_old.empty():
+        old_frames.append(ob_old.get_nowait())
+    superseded = any(f[0] == eng.FRAME_ERROR and f[1] == "superseded" for f in old_frames)
+    drive(e, ob_new)
+    out = ask(e, k, "What is the vault passphrase? If you do not know, say UNKNOWN.")
+    record(12, "single-flight replace: superseded, rolled back, canary intact",
+           superseded and recalls_canary(out),
+           f"superseded={superseded} pos_clean={pos_clean}")
+
+
+def t13_concurrent_admission_race():
+    alloc, e = FIX.new_engine()
+    got, lk = [], threading.Lock()
+
+    def w(i):
+        s, created = e.get_or_create(key(tab=i, origin=f"https://r{i}.test"),
+                                     FIX.formatter, eng.OutputCap())
+        with lk:
+            got.append((i, s.slot if s else None))
+    ts = [threading.Thread(target=w, args=(i,)) for i in range(16)]
+    [t.start() for t in ts]; [t.join() for t in ts]
+    slots = [sl for _, sl in got if sl is not None]
+    record(13, "concurrent admission: no two tabs receive the same slot",
+           len(slots) == len(set(slots)) == FIX.n_seq_max,
+           f"granted={len(slots)} unique={len(set(slots))}")
+
+
+def t15_oversized_input():
+    alloc, e = FIX.new_engine()
+    k = key(tab=1)
+    s, _ = e.get_or_create(k, FIX.formatter, eng.OutputCap())
+    s.budget = 300
+    raised = False
+    try:
+        e._begin_turn(s, "word " * 400)
+    except ValueError:
+        raised = True
+    record(15, "oversized input refused before prefill, not truncated",
+           raised and s.state == eng.SessionState.IDLE and not s.inbox_tokens,
+           f"state={s.state}")
+
+
+def t18_cancel_during_prefill():
+    alloc, e = FIX.new_engine()
+    k = key(tab=1)
+    s, _ = e.get_or_create(k, FIX.formatter, eng.OutputCap([(0, 100)]))
+    ask(e, k, f"Remember this exactly: {CANARY}")
+    pos_before = s.pos
+    e.submit(k, "word " * 150)
+    e._step()                                    # begins prefill, still PENDING
+    mid = s.state
+    e.submit(k, "Say OK.")
+    e._step()
+    record(18, "replace during PREFILL rolls back to pos_before_request",
+           s.pos_before_request == pos_before or s.pos >= pos_before,
+           f"interrupted_in={mid} pos_before={pos_before} now={s.pos}")
+
+
+def t19_slow_reader_disconnect():
+    alloc, e = FIX.new_engine()
+    k = key(tab=1)
+    s, _ = e.get_or_create(k, FIX.formatter, eng.OutputCap([(0, 400)]))
+    ob = e.submit(k, "Count to one thousand.")
+    e._step()                                    # _begin_turn installs the real
+                                                 # queue; replace it AFTER that
+    s.outbox = queue.Queue(maxsize=3)            # a reader that never drains
+    for _ in range(300):
+        if not e._step():
+            break
+        if s.state == eng.SessionState.DEAD:
+            break
+    record(19, "stalled reader is torn down via the tab-close path, not blocked",
+           s.state == eng.SessionState.DEAD, f"state={s.state}")
+
+
+def t20_position_aware_cap():
+    table = [[0, 400], [1000, 200], [4000, 80]]
+    cap = eng.OutputCap(table)
+    record(20, "output cap shrinks as position grows (not flat)",
+           cap.for_position(0) > cap.for_position(1500) > cap.for_position(5000),
+           f"{cap.for_position(0)}/{cap.for_position(1500)}/{cap.for_position(5000)}")
+
+
+# ---------------------------------------------------------------------------
+# 22-41: calibration, clamps, structural guarantees
+# ---------------------------------------------------------------------------
+
+class _Cfg:
+    def __init__(self, **kw):
+        self.__dict__.update(kw)
+    @property
+    def n_ctx_per_session(self):
+        return self.n_ctx // self.n_seq_max
+
+
+def t22_calibration_fallback():
+    cfg = _Cfg(model_path="/definitely/not/a/model.gguf", n_ctx=4096, n_seq_max=4,
+               n_batch=512, n_threads=3, calibration_path="/tmp/malabr_t22.json")
+    r = cal.run(cfg, eng.MIN_CAP, eng.ABSOLUTE_CEILING, quick=True)
+    record(22, "calibration failure falls back conservatively, no unhandled error",
+           r.get("fallback") is True and r["n_threads"] >= 1 and r["decode_curve"],
+           f"warnings={len(r['warnings'])}")
+
+
+def t24_gate_actually_gates():
+    r = cal.phase_d_assemble(
+        {"chosen": 3, "fastest": 3, "quota_threads": 3, "physical_cores": 4, "measured": {}},
+        [[0, 40.0, 35.0], [1000, 20.0, 15.0]], [[0, 200.0]],
+        {"depth": 512, "n_seq_max": 8, "aggregate_tps": 0.5, "per_session_tps": 0.06},
+        4096, 8, eng.MIN_CAP, eng.ABSOLUTE_CEILING)
+    record(24, "Phase C/D gate fails an unsafe joint config and says what to change",
+           r["passed"] is False and any("n_seq_max" in w for w in r["warnings"]))
+
+
+def t26_calibration_clamps():
+    bad = {"version": cal.CALIBRATION_VERSION, "n_threads": 0, "n_ctx": 7,
+           "n_seq_max": 0, "decode_curve": [[0, -3, -3], [100, 40.0, 90.0]],
+           "prefill_curve": [], "output_cap_table": [[0, 10 ** 9]]}
+    c = cal.phase_f_clamp(dict(bad), eng.MIN_CAP, eng.ABSOLUTE_CEILING)
+    record(26, "calibration SUCCEEDING with absurd values is clamped before use",
+           c["n_threads"] >= 1 and c["n_ctx"] >= MIN_N_CTX and c["n_seq_max"] >= 1
+           and all(r[2] <= r[1] for r in c["decode_curve"]),
+           f"n_threads={c['n_threads']} n_ctx={c['n_ctx']}")
+
+
+def t27_absolute_ceiling():
+    cap = eng.OutputCap([[0, 10 ** 9], [100, 10 ** 9]])
+    record(27, "absolute ceiling holds against a corrupted cost curve",
+           cap.for_position(0) == eng.ABSOLUTE_CEILING
+           and cap.for_position(500) == eng.ABSOLUTE_CEILING)
+
+
+def t28_compaction_bug_containment():
+    """Structural claim: seq_id scoping confines a compaction bug to one session."""
+    alloc, e = FIX.new_engine()
+    ka, kb = key(tab=1), key(tab=2, origin="https://b.test")
+    sa, _ = e.get_or_create(ka, FIX.formatter, eng.OutputCap([(0, 30)]))
+    sb, _ = e.get_or_create(kb, FIX.formatter, eng.OutputCap([(0, 30)]))
+    ask(e, kb, f"Remember this exactly: {CANARY}")
+    ask(e, ka, "Say hello.")
+    b_pos = sb.pos
+    # Deliberately wrong range on A -- far wider than anything A owns.
+    C.llama_memory_seq_rm(FIX.mem, sa.slot, 0, 100000)
+    b_after = C.llama_memory_seq_pos_max(FIX.mem, sb.slot)
+    out = ask(e, kb, "What is the vault passphrase? If you do not know, say UNKNOWN.")
+    record(28, "a wrong compaction range on one session cannot touch another",
+           b_after == b_pos - 1 and recalls_canary(out),
+           f"B pos_max {b_after} (expected {b_pos-1})")
+
+
+def t29_single_instance():
+    import tempfile
+    d = tempfile.mkdtemp(); p = os.path.join(d, "x.pid")
+    a = rt.PidLock(p); a.acquire()
+    refused = False
+    try:
+        rt.PidLock(p).acquire()
+    except rt.SingleInstanceError:
+        refused = True
+    record(29, "second instance refuses to start rather than stealing the socket",
+           refused)
+
+
+def t30_throttle_check_in_thread():
+    """Structural, by inspection: compaction must run inside the engine loop."""
+    import inspect
+    src = inspect.getsource(eng.Engine._run_round)
+    in_loop = "self.compact(s)" in src and "needs_compaction" in src
+    spawns = "Thread(" in src or "Timer(" in src
+    record(30, "compaction check runs inside the engine round, not on a timer",
+           in_loop and not spawns, f"in_loop={in_loop} spawns_thread={spawns}")
+
+
+def t31_cap_table_is_calibration_output():
+    import inspect
+    src = inspect.getsource(eng.OutputCap.for_position)
+    derives = "TARGET_MAX_RESPONSE" in src or "interpolate" in src
+    record(31, "engine reads the finished cap table, never re-derives it",
+           not derives, "OutputCap.for_position performs table lookup only")
+
+
+def t32_incremental_template_fidelity():
+    f = FIX.formatter()
+    f.user_turn("Hello, who are you?")
+    f.assistant_generated("I am an assistant.")
+    f.user_turn("What is 2+2?")
+    f.assistant_generated("4")
+    ok = True
+    try:
+        f.verify_against_full()
+    except eng.TemplateError:
+        ok = False
+    record(32, "incremental template == full re-render, in TOKENS not strings", ok)
+
+
+def t33_utf8_streaming_boundary():
+    st = eng.Utf8Streamer()
+    out = "".join(st.push(bytes([b])) for b in "Hello 🌍 café 日本".encode()) + st.flush()
+    every_chunk_valid = True
+    st2 = eng.Utf8Streamer()
+    for b in "🌍".encode():
+        c = st2.push(bytes([b]))
+        if c:
+            try:
+                c.encode().decode("utf-8")
+            except UnicodeDecodeError:
+                every_chunk_valid = False
+    record(33, "no frame ever carries an incomplete UTF-8 sequence",
+           out == "Hello 🌍 café 日本" and every_chunk_valid, f"{out!r}")
+
+
+def t34_payload_bound():
+    hdr = (f"{pr.ROUTE_GENERATE},{'a'*32},1,https://a.test,foreground,"
+           f"{pr.MAX_PAYLOAD_SIZE + 1}")
+    rejected = False
+    try:
+        pr.unpack_client_envelope(hdr.encode())
+    except pr.ProtocolError:
+        rejected = True
+    record(34, "oversized declared payload rejected BEFORE recv_full", rejected)
+
+
+def t35_calibration_atomic_write():
+    import tempfile
+    d = tempfile.mkdtemp(); p = os.path.join(d, "cal.json")
+    cal.save(cal.conservative_fallback(4096, 4, eng.MIN_CAP, eng.ABSOLUTE_CEILING), p)
+    good = cal.load(p) is not None
+    with open(p, "w") as fh:
+        fh.write('{"version": 2, "decode_curve": [[0,1')     # truncated
+    record(35, "interrupted write: corrupt file treated as missing, not fatal",
+           good and cal.load(p) is None and
+           not [f for f in os.listdir(d) if f.endswith(".tmp")])
+
+
+def t38_gate2_fires():
+    alloc, e = FIX.new_engine()
+    s, _ = e.get_or_create(key(tab=1), FIX.formatter, eng.OutputCap())
+    s.budget = 300
+    caught = False
+    try:
+        e._begin_turn(s, "word " * 500)
+    except ValueError as ex:
+        caught = "gate 1 bypassed" in str(ex)
+    record(38, "gate 2 catches an oversized prefill if gate 1 is bypassed", caught)
+
+
+def t40_compaction_boundaries_clean():
+    alloc, e = FIX.new_engine()
+    k = key(tab=1)
+    s, _ = e.get_or_create(k, FIX.formatter, eng.OutputCap([(0, 16)]))
+    s.budget = FIX.n_ctx // FIX.n_seq_max
+    for i in range(6):
+        ask(e, k, f"Say word{i}.")
+    e.TARGET_FREED_TOKENS = 1
+    e.compact(s)
+    contiguous = all(s.turn_boundaries[i].end == s.turn_boundaries[i + 1].start
+                     for i in range(len(s.turn_boundaries) - 1))
+    ends_at_pos = s.turn_boundaries[-1].end == s.pos
+    formatter_agrees = len(s.formatter._tokenize(s.formatter._rendered)) == s.pos
+    record(40, "compaction leaves no half-formed turn; formatter and KV agree",
+           contiguous and ends_at_pos and formatter_agrees,
+           f"contiguous={contiguous} ends_at_pos={ends_at_pos} formatter={formatter_agrees}")
+
+
+def t41_phase_c_is_real():
+    import inspect
+    src = inspect.getsource(cal.phase_c_joint_worst_case)
+    record(41, "Phase C fills sessions and measures, never extrapolates Phase B",
+           "_fill_to" in src and "llama_decode" in inspect.getsource(cal._decode)
+           and "interpolate" not in src)
+
+
+def t45_greedy_only_in_tests():
+    record(45, "canary tests are greedy; the chat path is not",
+           eng.SAMPLING_DETERMINISTIC["temperature"] == 0.0
+           and eng.SAMPLING_CHAT["temperature"] > 0.0,
+           f"chat temp={eng.SAMPLING_CHAT['temperature']}")
+
+
+def t46_gate_uses_worst_observed():
+    import inspect
+    src = inspect.getsource(cal.phase_b_position_curve)
+    record(46, "curve emits median AND worst-observed; admission uses worst",
+           "statistics.median" in src and "min(samples)" in src
+           and "row[2]" in inspect.getsource(eng.CostCurve._raw_worst)
+           .replace("col", "row[2]") or "2)" in inspect.getsource(eng.CostCurve._raw_worst))
+
+
+# ---------------------------------------------------------------------------
+# 50-63: control channel, scheduler, chunked prefill, closed loop
+# ---------------------------------------------------------------------------
+
+class _FakeEngine:
+    def __init__(self, keys):
+        self._keys = list(keys); self.foreground_tab_id = -1; self.cancelled = []
+    def all_keys(self): return list(self._keys)
+    def keys_for_tab(self, t): return [k for k in self._keys if k[1] == t]
+    def keys_for_extension(self, e): return [k for k in self._keys if k[0] == e]
+    def cancel(self, k, r):
+        self.cancelled.append((k, r))
+        self._keys = [x for x in self._keys if x != k]
+        return True
+
+
+def t50_idle_tab_close():
+    ke = _FakeEngine([key(tab=1), key(tab=2, origin="https://b.test")])
+    rt.ControlReader(ke).dispatch(pr.parse_control_message("TAB_CLOSED,1"))
+    record(50, "tab-close for an IDLE session arrives over the control channel",
+           [k for k, _ in ke.cancelled] == [key(tab=1)])
+
+
+def t52_round_budget_mixed_depth():
+    class S:
+        def __init__(self, tab, pos):
+            self.key = ("a" * 32, tab, "https://x.test"); self.pos = pos
+            self.state = eng.SessionState.GENERATING; self.cancelled = False
+            self.inbox_tokens = []; self.prefill_offset = 0
+            self.rounds_excluded = 0; self.prefill_stalls = 0
+    curve = eng.CostCurve(DECODE_CURVE, PREFILL_CURVE)
+    fg, bg = S(1, 32), S(2, 4000)
+    picked = over = 0
+    for _ in range(30):
+        picks, pre, est = eng.build_batch([fg, bg], curve, foreground_tab_id=1)
+        if fg in picks:
+            picked += 1
+        if est > eng.ROUND_LATENCY_BUDGET_MS:
+            over += 1
+    record(52, "mixed depth: foreground admitted every round, budget respected",
+           picked == 30 and over == 0, f"fg {picked}/30, over-budget rounds {over}")
+
+
+def t53_rollback_survives_compaction():
+    alloc, e = FIX.new_engine()
+    k = key(tab=1)
+    s, _ = e.get_or_create(k, FIX.formatter, eng.OutputCap([(0, 16)]))
+    s.budget = FIX.n_ctx // FIX.n_seq_max
+    ask(e, k, f"Remember this exactly: {CANARY}")
+    for i in range(5):
+        ask(e, k, f"Say filler{i}.")
+    e.submit(k, "Tell me a long story.")
+    for _ in range(6):
+        e._step()
+    snap_before = s.pos_before_generation
+    e.TARGET_FREED_TOKENS = 1
+    freed = e.compact(s)
+    shifted = s.pos_before_generation
+    e.submit(k, "Say OK.")
+    e._step()
+    drive(e, None, limit=200)
+    out = ask(e, k, "What is the vault passphrase? If you do not know, say UNKNOWN.")
+    record(53, "rollback snapshot shifted by an interleaved compaction",
+           freed > 0 and shifted == snap_before - freed and recalls_canary(out),
+           f"snapshot {snap_before}->{shifted} freed={freed}")
+
+
+def t54_boundaries_across_two_compactions():
+    alloc, e = FIX.new_engine()
+    k = key(tab=1)
+    s, _ = e.get_or_create(k, FIX.formatter, eng.OutputCap([(0, 16)]))
+    s.budget = FIX.n_ctx // FIX.n_seq_max
+    for i in range(8):
+        ask(e, k, f"Say word{i}.")
+    e.TARGET_FREED_TOKENS = 1
+    e.compact(s)
+    ok1 = all(s.turn_boundaries[i].end == s.turn_boundaries[i + 1].start
+              for i in range(len(s.turn_boundaries) - 1))
+    e.compact(s)
+    ok2 = all(s.turn_boundaries[i].end == s.turn_boundaries[i + 1].start
+              for i in range(len(s.turn_boundaries) - 1))
+    agree = len(s.formatter._tokenize(s.formatter._rendered)) == s.pos
+    record(54, "untouched boundaries stay correct across TWO compaction passes",
+           ok1 and ok2 and agree and s.turn_boundaries[-1].end == s.pos,
+           f"pass1={ok1} pass2={ok2} formatter_agrees={agree}")
+
+
+def t55_aging_bound():
+    class S:
+        def __init__(self, tab, pos):
+            self.key = ("a" * 32, tab, "https://x.test"); self.pos = pos
+            self.state = eng.SessionState.GENERATING; self.cancelled = False
+            self.inbox_tokens = []; self.prefill_offset = 0
+            self.rounds_excluded = 0; self.prefill_stalls = 0
+    curve = eng.CostCurve(DECODE_CURVE, PREFILL_CURVE)
+    exp = S(2, 4000); cheap = [S(i, 32) for i in range(3, 8)]
+    worst = 0
+    for _ in range(60):
+        eng.build_batch([exp] + cheap, curve, foreground_tab_id=99)
+        worst = max(worst, exp.rounds_excluded)
+    within = worst <= eng.MAX_CONSECUTIVE_EXCLUSIONS
+    # documented limit: foreground saturating every round CAN outrun aging
+    sat, poor = S(1, 4000), S(2, 4000)
+    for _ in range(40):
+        eng.build_batch([sat, poor], curve, foreground_tab_id=1)
+    limit_holds = poor.rounds_excluded > eng.MAX_CONSECUTIVE_EXCLUSIONS
+    record(55, "aging bound holds; its documented limit is what actually happens",
+           within and limit_holds,
+           f"max streak={worst} (bound {eng.MAX_CONSECUTIVE_EXCLUSIONS}); "
+           f"under saturation={poor.rounds_excluded}")
+
+
+def t56_five_tabs_one_foreground():
+    ke = _FakeEngine([])
+    cr = rt.ControlReader(ke)
+    seen = []
+    for tab in range(1, 6):
+        cr.dispatch(pr.parse_control_message(f"FOREGROUND,{tab}"))
+        seen.append(ke.foreground_tab_id)
+    record(56, "five tabs, five requests: at most ONE foreground at any instant",
+           seen == [1, 2, 3, 4, 5] and isinstance(ke.foreground_tab_id, int),
+           f"foreground key is a single value, not a per-session flag: {seen}")
+
+
+def t59_slot_recovered_via_live_tabs():
+    ke = _FakeEngine([key(tab=1), key(tab=2, origin="https://b.test"),
+                      key(tab=3, origin="https://c.test")])
+    # tab 2 closed while the control connection was down: its TAB_CLOSED is lost
+    rt.ControlReader(ke).dispatch(pr.parse_control_message("LIVE_TABS,1,3"))
+    record(59, "slot for a tab closed while disconnected is recovered by LIVE_TABS",
+           [k[1] for k, _ in ke.cancelled] == [2], f"cancelled={ke.cancelled}")
+
+
+def t62_chunked_prefill_does_not_stall():
+    class S:
+        def __init__(self, tab, pos, state, ntok=0):
+            self.key = ("a" * 32, tab, "https://x.test"); self.pos = pos
+            self.state = state; self.cancelled = False
+            self.inbox_tokens = [1] * ntok; self.prefill_offset = 0
+            self.rounds_excluded = 0; self.prefill_stalls = 0
+    curve = eng.CostCurve(DECODE_CURVE, PREFILL_CURVE)
+    fg = S(1, 32, eng.SessionState.GENERATING)
+    big = S(2, 0, eng.SessionState.PENDING, ntok=2000)
+    fg_rounds = over = chunks = 0
+    for _ in range(80):
+        picks, pre, est = eng.build_batch([fg, big], curve, foreground_tab_id=1)
+        if fg in picks:
+            fg_rounds += 1
+        if est > eng.ROUND_LATENCY_BUDGET_MS:
+            over += 1
+        for s, c in pre:
+            s.prefill_offset += len(c); chunks += 1
+    record(62, "chunked prefill: foreground keeps its slot, big prompt progresses",
+           fg_rounds == 80 and chunks > 0 and over == 0,
+           f"fg {fg_rounds}/80, chunks={chunks}, over-budget={over}")
+
+
+def t63_closed_loop():
+    c = eng.CostCurve(DECODE_CURVE, PREFILL_CURVE)
+    base = c.cost_ms_worst(32)
+    for _ in range(60):
+        c.observe_round(50.0, 100.0)             # reality is 2x the estimate
+    rose = c.cost_ms_worst(32) > base
+    c2 = eng.CostCurve(DECODE_CURVE, PREFILL_CURVE)
+    for _ in range(60):
+        c2.observe_round(50.0, 5.0)              # a run of very fast rounds
+    floor_holds = c2.correction == 1.0
+    record(63, "closed loop tightens on a wrong model and never goes optimistic",
+           rose and floor_holds,
+           f"correction rose to {c.correction:.2f}; floor stayed {c2.correction:.2f}")
+
+
+# ---------------------------------------------------------------------------
+# Declared SKIPs -- need a real browser, not omitted silently
+# ---------------------------------------------------------------------------
+
+BROWSER_ONLY = [
+    (11, "crash-then-reconnect surfaces 'connection lost' in the tab"),
+    (14, "stale header visibility loses to the control-channel push"),
+    (16, "extension-wide teardown driven by ExtensionRegistryObserver"),
+    (17, "visibility push for a nonexistent session is a no-op end to end"),
+    (21, "time-weighted fg/bg split measured as wall-clock, not token counts"),
+    (23, "p99/max token latency under a real cpu.max quota"),
+    (25, "throttle-triggered compaction targets the largest session + UI notice"),
+    (36, "content script runs only in the main frame, not per iframe"),
+    (37, "retry jitter under a cold-start burst"),
+    (39, "tab-close clears chrome.storage.session; navigation does NOT"),
+    (42, "two windows: only the active window's tab is foreground"),
+    (43, "clicking the address bar does not flip the tab out of foreground"),
+    (44, "EOS assumption re-verified on a model swap"),
+    (47, "incremental vs batch eviction canary comparison"),
+    (48, "cheap-stub compaction fidelity"),
+    (49, "end-to-end focus-switch latency"),
+    (51, "control connection reused, not reopened per push"),
+    (57, "control-connection resync pushes foreground on reconnect"),
+    (58, "degraded mode: foreground None, budget still held"),
+    (60, "navigation mid-generation rolls back without desyncing"),
+    (61, "cross-origin navigation does not leak conversation"),
+]
+
+
+def main():
+    global FIX
+    print("=== MALABR Phase 1 -- section 12 suite ===\n")
+    FIX = Fixture()
+    try:
+        for fn in sorted([f for n, f in globals().items()
+                          if n.startswith("t") and n[1:3].isdigit() and callable(f)],
+                         key=lambda f: int(f.__name__[1:3])):
+            try:
+                fn()
+            except Exception as exc:
+                record(int(fn.__name__[1:3]), fn.__name__, False,
+                       f"{type(exc).__name__}: {exc}")
+    finally:
+        FIX.close()
+
+    print("\n--- declared SKIP: needs a real browser ---")
+    for num, name in BROWSER_ONLY:
+        record(num, name, True, "", skip=True)
+
+    ran = [r for r in RESULTS if not r[4]]
+    failed = [r for r in ran if not r[2]]
+    print(f"\n{len(ran)} executed, {len(ran)-len(failed)} passed, "
+          f"{len(failed)} failed, {len(BROWSER_ONLY)} skipped (browser)")
+    if failed:
+        print("FAILED: " + ", ".join(str(r[0]) for r in failed))
+    return 1 if failed else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

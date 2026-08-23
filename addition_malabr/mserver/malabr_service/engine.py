@@ -329,7 +329,14 @@ class ChatFormatter:
         NOT the turn terminator (generation stops AT the end-of-generation
         token and never decodes it) and NOT the next generation prompt.
         """
-        if self._messages and self._messages[-1][0] == "assistant":
+        if not self._messages:
+            # An empty conversation means an empty KV. The template still emits
+            # a bare generation prompt ('<|im_start|>assistant\n' on Qwen3) for
+            # zero messages, and returning that would claim content the cache
+            # does not hold -- which breaks the prefix check on the very next
+            # turn. Rolling a session's first turn back is exactly this case.
+            return ""
+        if self._messages[-1][0] == "assistant":
             return self._apply(self._messages[:-1], True) + self._messages[-1][1]
         return self._apply(self._messages, True)
 
@@ -356,13 +363,21 @@ class ChatFormatter:
         rendered conversation -- that must roll back in lockstep. Rolling back
         one without the other desyncs the formatter from the KV, and the next
         turn is built on a conversation the model never saw.
+
+        A MESSAGE COUNT, not a (count, rendered_length) pair. The length form
+        was wrong for the same reason section 8 gives about absolute positions:
+        a compaction firing while the checkpoint is live shortens _rendered
+        underneath it, and restoring to the old length then leaves the
+        formatter describing text that no longer exists. A count survives that,
+        because compact() can shift it exactly as it shifts every position.
         """
-        return (len(self._messages), len(self._rendered))
+        return len(self._messages)
 
     def restore(self, cp):
-        n_messages, n_rendered = cp
-        del self._messages[n_messages:]
-        self._rendered = self._rendered[:n_rendered]
+        del self._messages[int(cp):]
+        # Recompute rather than truncate: _expected_render() already knows what
+        # the KV holds for each phase, so this cannot drift out of step with it.
+        self._rendered = self._expected_render()
 
     # -- self-check for the section 12 harness ---------------------------------
 
@@ -1191,6 +1206,14 @@ class Engine:
             for other in s.turn_boundaries:
                 if other is not turn and other.msg_index > turn.msg_index:
                     other.msg_index -= 2
+            # The live rollback checkpoint is ALSO a reference into the message
+            # list, and it goes stale here exactly like a position does. Missing
+            # this made a replace-after-compaction restore to a message count
+            # that no longer existed, and the formatter's own prefix check
+            # caught it as "template broke the prefix property".
+            if s.formatter_cp_before_request is not None \
+                    and s.formatter_cp_before_request > turn.msg_index:
+                s.formatter_cp_before_request -= 2
 
             s.turn_boundaries.remove(turn)
             freed += n
@@ -1439,7 +1462,14 @@ def build_batch(sessions, cost_curve, foreground_tab_id,
             s.prefill_stalls += 1
             if s.prefill_stalls < MAX_PREFILL_STALLS:
                 continue
-            n = min(PREFILL_CHUNK_MIN, remaining_toks)
+            # Admit what the budget CAN afford, not a full minimum chunk.
+            # Forcing PREFILL_CHUNK_MIN through was measured to overrun by
+            # 87ms against a 50ms budget, in 20% of rounds -- it broke the
+            # very bound §9a/§6a exist to hold, to fix a starvation problem.
+            # PREFILL_CHUNK_MIN is an EFFICIENCY floor ("below this, per-call
+            # overhead dominates"), not a correctness one, so trading a little
+            # efficiency to keep the latency bound is the right way round.
+            n = max(1, min(affordable, remaining_toks))
         if n <= 0:
             continue
         s.prefill_stalls = 0

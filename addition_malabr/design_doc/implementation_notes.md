@@ -30,7 +30,7 @@ then:
 8. [DONE] config.py — startup-computed n_ctx/n_threads, calibration path
 9. [DONE] calibration.py — §11a phases A–G + Phase B-prefill
 10.[DONE] deleted supervisor.py/training.py/storage.py; wrote real app.py
-11.[ ] §12 harness (31 numbered tests)
+11.[DONE] §12 harness — 42 executed, 21 declared browser-only skips
 
 ## Verified facts from measurement
 
@@ -208,3 +208,38 @@ Three things worth recording:
 - **The measured trial spread (1–15%) justifies the median/worst split.** At
   pos 256 the spread was 15%, so a round admitted on the median estimate there
   really could overrun its budget.
+
+### Corrections found by running the §12 suite
+
+15. **§9b's forced prefill chunk broke the very bound it sits inside.** My
+    anti-starvation fix (force `PREFILL_CHUNK_MIN` through after N stalls) was
+    measured to overrun the round budget by **87 ms against 50 ms, in 20% of
+    rounds**. That trades "prefill never runs" for "the ~50ms preemption bound
+    breaks regularly", which is the wrong way round — the bound is the
+    headline claim. Fixed to admit `max(1, affordable)` instead:
+    `PREFILL_CHUNK_MIN` is an EFFICIENCY floor ("below this, per-call overhead
+    dominates"), not a correctness one. Result: 0 over-budget rounds, prompt
+    still progresses.
+
+16. **The formatter rollback checkpoint goes stale across compaction —
+    §8's own warning, applied to a reference §8 does not know exists.** §8
+    lists the live absolute positions compaction must shift. The formatter
+    checkpoint added for correction 4 is another one, and missing it made a
+    replace-after-compaction restore to a message count that no longer
+    existed. Caught by the formatter's own prefix check (§12 test 53), not by
+    review. The checkpoint is now a message COUNT, shifted in `compact()` like
+    any position, rather than a `(count, rendered_length)` pair.
+
+17. **An empty conversation must render as the empty string.** The chat
+    template emits a bare generation prompt for zero messages
+    (`'<|im_start|>assistant\n'` on Qwen3). Returning that after rolling a
+    session's FIRST turn back claims KV content the cache does not hold, and
+    breaks the prefix check on the next turn.
+
+### §12 coverage
+
+42 tests execute here. 21 are declared SKIP because they need a real browser
+(window focus, iframes, `chrome.storage.session`, content-script injection,
+`cpu.max` quota timing) — listed explicitly in `tests/test_phase1.py` rather
+than silently omitted, so the gap between "Phase 1 done" and "Phase 1 tested
+here" stays visible.
