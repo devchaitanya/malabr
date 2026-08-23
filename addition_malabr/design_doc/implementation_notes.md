@@ -27,7 +27,7 @@ implementation decision had to be taken.
 then:
 6. [DONE] protocol.py — 6-field header, frames, payload bound, control msgs
 7. [DONE] runtime.py — control route, reader thread, PID lock
-8. [ ] config.py  — n_ctx, n_seq_max, calibration path
+8. [DONE] config.py — startup-computed n_ctx/n_threads, calibration path
 9. [ ] calibration.py — §11a phases A–G + Phase B-prefill
 10.[ ] gut supervisor.py; DELETE training.py, storage.py
 11.[ ] §12 harness (31 numbered tests)
@@ -164,3 +164,18 @@ then:
     is dangerous; the ordering is the specific part that matters. The socket is
     only unlinked AFTER the pid lock confirms no live owner, otherwise a second
     process can delete a live instance's socket and steal the path.
+
+14. **§11's memory formula and §7's stated `n_ctx` disagree by 4.6x, and the
+    formula is the wrong one.** §11 gives
+    `n_ctx = MemAvailable * 0.8 / BYTES_PER_TOKEN`; §7 states `n_ctx = 16384`
+    outright. On the development machine the formula yields **75,340 tokens
+    (7.7 GB of KV)** against §7's 16,384 (1.7 GB). The formula overshoots for
+    three reasons: `MemAvailable` counts reclaimable page cache as free, which
+    is true for transient allocations and false for a permanent one-shot
+    reservation (here almost all of that 9 GB is cache, and swap is already
+    full); it never subtracts the model weights, which are also resident; and
+    it leaves nothing for the browser — whose protection is the entire point of
+    the design. Corrected to `0.5 * (MemAvailable - browser_reserve -
+    model_bytes)`, capped at §7's 16384. That lands on exactly 2048
+    tokens/session on reference hardware and degrades sensibly on smaller
+    machines (2 GB -> 4096 floor, 4 GB -> 6880). **Recommend correcting §11.**
