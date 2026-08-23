@@ -39,7 +39,7 @@ resume after context is summarized. UPDATE THIS FILE EVERY CYCLE.
 2. [DONE] chat template application (§6c) — ChatFormatter, model-agnostic
 3. [DONE] single-threaded engine loop, EOS / output cap (+ §6d streamer, §8 cap)
 4. [DONE] compaction (§8) + position-shift fix + input-cap gate 2
-5. [ ] scheduler §9a/§9b  (round budget, aging, chunked prefill, closed loop)
+5. [DONE] scheduler §9a/§9b (round budget, aging, chunked prefill, closed loop)
 then:
 6. [ ] protocol.py — 6-field header, frames, payload bound
 7. [ ] runtime.py — control route, reader thread
@@ -126,7 +126,24 @@ then:
    the preceding assistant block (a consequence of §6c deriving deltas from the
    template) — so dropping a whole exchange leaves the survivor's block closed
    by the next surviving delta, well-formed with no repair step.
-7. **Stop condition uses `llama_vocab_is_eog`, not `== llama_vocab_eos`.**
+7. **§9a's aging pass cannot rescue a session costing more than the whole
+   budget — its prose and its code disagree.** §9a says a deep session "simply
+   runs alone in its own round, spending the whole budget on itself, which
+   harms nobody else". Its code gives that unconditional-first-pick escape ONLY
+   to foreground. Measured: a background session at pos 6000 (100ms vs a 50ms
+   round) was excluded 60/60 rounds with NO foreground present — permanent
+   starvation, not the bounded limit §9a describes. FIX: aged background gets
+   the same `or not picks` escape. Streak then bounded at exactly 5.
+   **Recommend correcting §9a.**
+8. **§9b's prefill chunk-minimum rule starves, taken literally.** §9b says
+   "if n < PREFILL_CHUNK_MIN and n < remaining: continue  # wait for a rounder
+   budget". If decode picks keep leaving less than a minimum chunk's budget,
+   that holds EVERY round and the prompt is never prefilled. Measured: 200
+   rounds, zero chunks. §9b bounds decode starvation with aging but leaves
+   prefill unbounded. FIX: MAX_PREFILL_STALLS, then force one minimum chunk —
+   overruns the bound by at most one chunk, which is finite, unlike never
+   answering. **Recommend correcting §9b.**
+9. **Stop condition uses `llama_vocab_is_eog`, not `== llama_vocab_eos`.**
    §5b describes the EOS check as verified-correct, but eos() returns ONE token
    while Qwen3 flags SIX as end-of-generation (gemma-3 flags 3). Comparing
    against eos alone would miss the rest and run to the output cap.
@@ -136,6 +153,19 @@ then:
 
 - cycle 0 (start): SlotAllocator written + 15 checks passing; lock rationale
   comment corrected after measurement disproved it.
+- cycle 5: §9a/§9b scheduler + batched engine round. CostCurve (median vs
+  worst-observed), build_batch (fg unconditional, aging, cheapest-first),
+  chunked prefill, closed loop (EWMA, floor 1.0, ceiling 8.0). Engine now runs
+  ONE batched llama_decode carrying prefill chunks and decode tokens together.
+  THREE real bugs found: (a) §9a aging cannot rescue an over-budget session —
+  prose and code disagree; (b) §9b's chunk-min rule starves prefill outright;
+  (c) llama_get_logits_ith takes the BATCH index, not the ordinal among tokens
+  requesting logits — crashed with GGML_ASSERT(logits != nullptr). That last
+  one was latent while sampling used index -1; batching made it real.
+  Also fixed my own inconsistency: prefill_tokens_affordable returned 0 when
+  uncalibrated while the comment claimed one min chunk per round — an
+  uncalibrated engine would never prefill.
+  §12 tests 52/55/62 now have implementations + negative controls.
 - cycle 4: compaction (§8). Verified seq_rm/seq_add semantics against the real
   model first (removes [p0,p1); seq_add(p0,-1,d) shifts everything >=p0).
   Position-shift fix applied to turn boundaries, BOTH §6b snapshots, s.pos, and

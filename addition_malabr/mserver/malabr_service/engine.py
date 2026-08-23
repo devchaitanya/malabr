@@ -611,6 +611,16 @@ class Session:
         self.turn_boundaries = []
         self.budget = 2048              # n_ctx / n_seq_max; set by the caller
 
+        # §9a aging: consecutive rounds this session was passed over.
+        self.rounds_excluded = 0
+        # §9b: consecutive rounds a PENDING session was skipped because the
+        # leftover budget could not fund a minimum-size chunk. Not in §9b --
+        # see build_batch for the starvation this prevents.
+        self.prefill_stalls = 0
+        # The token this session must decode next round. Set when sampled,
+        # consumed when the next batch is composed.
+        self.next_token = None
+
         # Checked at the TOP of the loop, before dispatch -- same <=1-token
         # bound as tab-close cancellation, same flag pattern, no new machinery.
         self.pending_replace = None
@@ -690,6 +700,9 @@ class Engine:
         self._running = False
         self._thread = None
         self.foreground_tab_id = -1         # section 5f: ONE key, not a per-session flag
+        # Held from calibration's Phase D output at startup, never re-derived
+        # per round (§12 test 31).
+        self.cost_curve = CostCurve()
 
     # -- registry (called from connection threads) --------------------------
 
@@ -781,24 +794,112 @@ class Engine:
         # cancellation unrepresentable.
         self._apply_control()
 
-        s = self._pick()
-        if s is None:
-            return False
         try:
-            if s.state == SessionState.PENDING:
-                self._prefill_step(s)
-            elif s.state == SessionState.GENERATING:
-                self._decode_step(s)
-            else:
-                return False
-        except OutboxFull as e:
-            # Stalled reader: same teardown path as a dead one (section 7).
-            s.terminate(FRAME_ERROR, "reader stalled")
-            self._teardown(s, str(e))
-        except SlotWipeError as e:
-            s.terminate(FRAME_ERROR, "slot integrity failure")
-            self._teardown(s, str(e))
+            return self._run_round()
+        except OutboxFull:
+            return True
+        except SlotWipeError:
+            return True
+
+    def _run_round(self):
+        """One batched round: prefill chunks and decode tokens in ONE pass."""
+        with self._reg_lock:
+            sessions = list(self._sessions.values())
+
+        # §8: the 95% check runs BEFORE composition, never after. One batched
+        # decode advances several sessions' pos at once, so checking afterwards
+        # races the batch -- a session one token from its ceiling gets pushed
+        # past it before anything re-checks.
+        for s in sessions:
+            if s.state in (SessionState.PENDING, SessionState.GENERATING) \
+                    and not s.cancelled and self.needs_compaction(s):
+                self.compact(s)
+
+        decode_picks, prefill_chunks, estimated_ms = build_batch(
+            sessions, self.cost_curve, self.foreground_tab_id)
+        if not decode_picks and not prefill_chunks:
+            return False
+
+        # Slots must be provably wiped before ANY token enters them. On the
+        # engine thread, which is the whole point of the prepare/acquire split.
+        for s in decode_picks:
+            self._alloc.assert_ready(s.slot)
+        for s, _ in prefill_chunks:
+            if s.slot in self._alloc.pending_wipe:
+                self._alloc.prepare(s.slot)
+            self._alloc.assert_ready(s.slot)
+
+        items, owner = [], {}
+        for s in decode_picks:
+            owner[len(items)] = ("decode", s)
+            items.append((s.next_token, s.pos, s.slot, True))
+        for s, chunk in prefill_chunks:
+            for i, tok in enumerate(chunk):
+                last = (i == len(chunk) - 1)
+                completes = last and (s.prefill_offset + len(chunk) >= len(s.inbox_tokens))
+                if completes:
+                    owner[len(items)] = ("prefill", s)
+                items.append((tok, s.pos + i, s.slot, completes))
+
+        t0 = time.perf_counter()
+        self._decode_batch(items)
+        observed_ms = (time.perf_counter() - t0) * 1000.0
+
+        # Each decode pick carried one token AT s.pos; it now occupies that
+        # position. Advancing here, not in _sample_and_emit, keeps pos in step
+        # with what the batch actually wrote -- the sampling that follows reads
+        # logits produced BY these positions.
+        for s in decode_picks:
+            s.pos += 1
+
+        # §9b part 2: feed the REAL round time back. Open-loop, a wrong cost
+        # model silently violates the bound and only a dedicated experiment
+        # would reveal it. Closed-loop, it shrinks batches until reality fits.
+        self.cost_curve.observe_round(estimated_ms, observed_ms)
+
+        for s, chunk in prefill_chunks:
+            s.pos += len(chunk)
+            s.prefill_offset += len(chunk)
+            if s.prefill_offset >= len(s.inbox_tokens):
+                s.pos_before_generation = s.pos
+                if s.sampler is None:
+                    s.sampler = self._make_sampler(s)
+                s.state = SessionState.GENERATING
+
+        for batch_i, (kind, s) in owner.items():
+            if s.state != SessionState.GENERATING or s.cancelled:
+                continue
+            try:
+                # batch index, NOT the output ordinal -- see _decode_batch.
+                self._sample_and_emit(s, batch_i)
+            except OutboxFull as e:
+                s.terminate(FRAME_ERROR, "reader stalled")
+                self._teardown(s, str(e))
         return True
+
+    def _sample_and_emit(self, s, logits_index):
+        """Produce exactly ONE token for this session, then return.
+
+        Returning after every single token IS the preemption mechanism --
+        nothing ever commits to more than one token, so a foreground request
+        arriving mid-background-generation waits at most one round.
+        """
+        tok = C.llama_sampler_sample(s.sampler, self._ctx, logits_index)
+        cap = s.output_cap.for_position(s.pos)
+        if is_stop_token(self._vocab, tok):
+            self._finish_turn(s, FRAME_COMPLETE, "eos")
+            return
+        if s.produced >= cap:
+            self._finish_turn(s, FRAME_COMPLETE, "cap")
+            return
+        C.llama_sampler_accept(s.sampler, tok)
+        raw = self._token_bytes(tok)
+        s._reply_bytes.extend(raw)
+        text = s.streamer.push(raw)
+        if text:
+            s.emit(FRAME_TOKEN, text)
+        s.next_token = tok
+        s.produced += 1
 
     def _apply_control(self):
         with self._reg_lock:
@@ -826,6 +927,21 @@ class Engine:
         s.pos_before_request = s.pos            # snapshot 1 (section 6b)
         s.formatter_cp_before_request = s.formatter.checkpoint()
         s.inbox_tokens = s.formatter.user_turn(text)
+        # Section 8 gate 2: defense in depth at the point of no return. Gate 1
+        # lives upstream at admission; one check point is a single point of
+        # failure, and this one is structurally unskippable by anything above
+        # it, because no turn can start without passing through here. If it ever
+        # fires, something upstream is broken -- that is the signal, not silent
+        # tolerance of the oversized input.
+        max_input = s.budget - RESERVED_FOR_RESPONSE
+        if len(s.inbox_tokens) > max_input:
+            s.formatter.restore(s.formatter_cp_before_request)
+            s.formatter_cp_before_request = None
+            s.state = SessionState.IDLE
+            s.inbox_tokens = []
+            raise ValueError(
+                f"gate 1 bypassed: {len(s.inbox_tokens)} tokens > "
+                f"max_input {max_input}")
         s.prefill_offset = 0
         s.produced = 0
         s.streamer = Utf8Streamer()
@@ -876,25 +992,6 @@ class Engine:
             C.llama_sampler_free(s.sampler)
             s.sampler = None
 
-    def _pick(self):
-        """Choose one runnable session. Replaced by §9a/§9b's scheduler later.
-
-        Cancelled and DEAD sessions are excluded HERE, before any dispatch --
-        that exclusion is what makes mid-batch cancellation impossible rather
-        than merely unlikely.
-        """
-        with self._reg_lock:
-            runnable = [s for s in self._sessions.values()
-                        if s.state in (SessionState.PENDING, SessionState.GENERATING)
-                        and not s.cancelled]
-        if not runnable:
-            return None
-        # Foreground first. One key on the registry, not a per-session boolean:
-        # a boolean can represent "5 tabs foreground at once", which is a state
-        # that must be unrepresentable (section 5f).
-        fg = [s for s in runnable if s.key[1] == self.foreground_tab_id]
-        return (fg or runnable)[0]
-
     # -- the two model-touching steps ---------------------------------------
 
     def _make_sampler(self, s):
@@ -925,13 +1022,23 @@ class Engine:
         return chain
 
     def _decode_batch(self, items):
-        """items: [(token, pos, seq_id, want_logits)] -> logits index per item."""
+        """items: [(token, pos, seq_id, want_logits)] -> batch indices with logits.
+
+        API subtlety that cost a crash: llama_get_logits_ith(ctx, i) -- which is
+        what llama_sampler_sample calls -- takes the index WITHIN THE BATCH, not
+        the ordinal among tokens that requested logits. llama.cpp maps it through
+        an internal output_ids table. Passing the compacted ordinal aborts with
+        GGML_ASSERT(logits != nullptr).
+
+        This stayed latent while the engine sampled with index -1 ("last
+        output"), which sidesteps the question. Batching makes several outputs
+        per round real, so it had to be got right.
+        """
         n = len(items)
         batch = C.llama_batch_init(n, 0, 1)
         try:
             batch.n_tokens = n
-            idx = {}
-            out_i = 0
+            idx = []
             for i, (tok, pos, seq, want) in enumerate(items):
                 batch.token[i] = tok
                 batch.pos[i] = pos
@@ -939,8 +1046,7 @@ class Engine:
                 batch.seq_id[i][0] = seq
                 batch.logits[i] = 1 if want else 0
                 if want:
-                    idx[i] = out_i
-                    out_i += 1
+                    idx.append(i)
             rc = C.llama_decode(self._ctx, batch)
             if rc != 0:
                 # Checked, not ignored. The handoff records two past cases where
@@ -951,77 +1057,6 @@ class Engine:
             return idx
         finally:
             C.llama_batch_free(batch)
-
-    def _prefill_step(self, s):
-        """Prefill the prompt. Chunking (§9b) replaces the all-at-once call."""
-        # The wipe happens HERE, on the engine thread, because llama.h
-        # guarantees thread-safety only for the tokenization API -- mutating KV
-        # from the connection thread that called acquire() would race
-        # llama_decode. Guarded so it fires only on a slot's first use: prepare()
-        # clears the WHOLE sequence, so running it on a later turn would erase
-        # the conversation instead of protecting it.
-        if s.slot in self._alloc.pending_wipe:
-            self._alloc.prepare(s.slot)
-        self._alloc.assert_ready(s.slot)     # refuses an unwiped slot
-        toks = s.inbox_tokens
-        if not toks:
-            s.state = SessionState.IDLE
-            return
-        # Section 8 gate 2: defense in depth at the actual point of no return.
-        # Gate 1 lives upstream at admission; one check point is a single point
-        # of failure, and this one is structurally unskippable by anything above
-        # it. If it ever fires, something upstream is broken -- that is the
-        # signal, not silent tolerance of the oversized input.
-        max_input = s.budget - RESERVED_FOR_RESPONSE
-        if len(toks) > max_input:
-            raise ValueError(
-                f"gate 1 bypassed: {len(toks)} tokens > max_input {max_input}")
-        items = [(t, s.pos + i, s.slot, i == len(toks) - 1)
-                 for i, t in enumerate(toks)]
-        self._decode_batch(items)
-        s.pos += len(toks)
-        s.prefill_offset = len(toks)
-
-        # Snapshot 2 (section 6b), taken once prefill completes and BEFORE the
-        # first output token, so an interrupted response rolls back to exactly
-        # the end of the prompt rather than into the middle of it.
-        s.pos_before_generation = s.pos
-        if s.sampler is None:
-            s.sampler = self._make_sampler(s)
-        s.state = SessionState.GENERATING
-
-    def _decode_step(self, s):
-        """Produce exactly ONE token, then return to the scheduler.
-
-        Returning after every single token IS the preemption mechanism --
-        nothing ever commits to more than one token, so a foreground request
-        arriving mid-background-generation waits at most one token (~50ms under
-        the Phase 1 cpu.max quota; ~23ms unthrottled).
-        """
-        self._alloc.assert_ready(s.slot)
-        tok = C.llama_sampler_sample(s.sampler, self._ctx, -1)
-
-        cap = s.output_cap.for_position(s.pos)
-        if is_stop_token(self._vocab, tok):
-            self._finish_turn(s, FRAME_COMPLETE, "eos")
-            return
-        if s.produced >= cap:
-            # The cap is a real completion, not an error: the turn DOES enter
-            # permanent context (section 6b's rule names EOS and the output cap
-            # as the two ways a turn is kept).
-            self._finish_turn(s, FRAME_COMPLETE, "cap")
-            return
-
-        C.llama_sampler_accept(s.sampler, tok)
-        raw = self._token_bytes(tok)
-        s._reply_bytes.extend(raw)
-        text = s.streamer.push(raw)
-        if text:
-            s.emit(FRAME_TOKEN, text)
-
-        self._decode_batch([(tok, s.pos, s.slot, True)])
-        s.pos += 1
-        s.produced += 1
 
     def _finish_turn(self, s, frame_type, reason):
         # Record the completed exchange BEFORE the streamer is flushed, so the
@@ -1125,3 +1160,249 @@ class Engine:
         if n < 0:
             raise RuntimeError(f"llama_token_to_piece failed ({n})")
         return buf.raw[:n]
+
+
+# ---------------------------------------------------------------------------
+# Sections 9a / 9b -- batch composition by latency budget, and the closed loop
+# ---------------------------------------------------------------------------
+
+ROUND_LATENCY_BUDGET_MS = 50      # the bound §7 already commits to elsewhere
+MAX_CONSECUTIVE_EXCLUSIONS = 5    # aging bound; no measured value yet
+PREFILL_CHUNK_MIN = 32            # below this, per-call overhead dominates
+MAX_PREFILL_STALLS = 5            # see build_batch -- not in §9b, see note there
+MAX_CORRECTION = 8.0              # §9b leaves this unnamed; see observe_round
+
+
+class CostCurve:
+    """Per-position cost estimates, with a closed loop on top (§9b part 2).
+
+    Two statistics from the same data, for two different purposes -- §11a's own
+    rule. The MEDIAN feeds representative things like the output-cap formula.
+    The WORST-OBSERVED feeds hard cutoffs like batch admission, because the
+    measured trial-to-trial spread is real (up to ~19% at short context) and a
+    round estimated from the median could quietly run 20% over the bound it
+    exists to enforce.
+    """
+
+    def __init__(self, decode_table=None, prefill_table=None):
+        # decode_table: [(pos, tps_median, tps_worst)]
+        # prefill_table: [(pos, tok_per_s_worst)]
+        self._decode = sorted(decode_table) if decode_table else None
+        self._prefill = sorted(prefill_table) if prefill_table else None
+        self.correction = 1.0
+
+    # -- interpolation -----------------------------------------------------
+
+    @staticmethod
+    def _lookup(table, pos, col):
+        lo = table[0]
+        for row in table:
+            if row[0] <= pos:
+                lo = row
+            else:
+                hi = row
+                span = hi[0] - lo[0]
+                if span <= 0:
+                    return lo[col]
+                f = (pos - lo[0]) / span
+                return lo[col] + f * (hi[col] - lo[col])
+        return lo[col]
+
+    def _raw_worst(self, pos):
+        if not self._decode:
+            # No calibration yet. Assume the WHOLE budget per token: the most
+            # conservative possible estimate, so an uncalibrated engine degrades
+            # to one session per round rather than over-admitting on a guess.
+            return ROUND_LATENCY_BUDGET_MS
+        tps = self._lookup(self._decode, pos, 2)
+        if tps <= 0:
+            return ROUND_LATENCY_BUDGET_MS
+        return 1000.0 / tps
+
+    def cost_ms_worst(self, pos):
+        return self._raw_worst(pos) * self.correction
+
+    def cost_ms_median(self, pos):
+        if not self._decode:
+            return ROUND_LATENCY_BUDGET_MS
+        tps = self._lookup(self._decode, pos, 1)
+        return ROUND_LATENCY_BUDGET_MS if tps <= 0 else 1000.0 / tps
+
+    # -- prefill (§9b Phase B-prefill) --------------------------------------
+
+    def prefill_ms(self, n_tokens, pos=0):
+        """Prefill cost is NOT decode cost; reusing the decode curve is wrong.
+
+        Decode is memory-bandwidth-bound -- one token, but every prior K/V
+        vector is read, which is why the decode curve collapses 48 -> 5 tok/s
+        with depth. Prefill is compute-bound and parallel: many tokens in one
+        pass amortising the same weight read, typically an order of magnitude
+        faster and scaling differently with depth.
+        """
+        if n_tokens <= 0:
+            return 0.0
+        if not self._prefill:
+            # Uncalibrated: refuse to pretend. Charging the full budget makes
+            # exactly one minimum-size chunk affordable per round.
+            return float(ROUND_LATENCY_BUDGET_MS)
+        tps = self._lookup(self._prefill, pos, 1)
+        if tps <= 0:
+            return float(ROUND_LATENCY_BUDGET_MS)
+        return (n_tokens * 1000.0 / tps) * self.correction
+
+    def prefill_tokens_affordable(self, budget_ms, pos=0):
+        if budget_ms <= 0:
+            return 0
+        if not self._prefill:
+            # Uncalibrated. Returning 0 here would mean a PENDING session is
+            # NEVER prefilled -- the engine would sit with an unanswerable
+            # prompt, rescued only after MAX_PREFILL_STALLS rounds by the aging
+            # path. One minimum chunk per round is the honest conservative
+            # behaviour, and matches what prefill_ms() charges.
+            return PREFILL_CHUNK_MIN
+        tps = self._lookup(self._prefill, pos, 1)
+        if tps <= 0:
+            return 0
+        return int((budget_ms / 1000.0) * tps / max(self.correction, 1e-9))
+
+    # -- the closed loop ----------------------------------------------------
+
+    def observe_round(self, estimated_ms, observed_ms):
+        """Feed the real round time back, so a wrong model degrades not lies.
+
+        This project has already been burned by this exact class of assumption:
+        Phase C's naive extrapolation predicted ~41 tok/s where the real joint
+        measurement gave 12.5 -- a 3x error in the OPTIMISTIC direction. Nothing
+        else stops that recurring here, and it would fail silently, with rounds
+        simply running long while the code believed they fit.
+        """
+        if estimated_ms <= 0 or observed_ms < 0:
+            return
+        ratio = observed_ms / estimated_ms
+        # EWMA so one slow round -- a GC pause, a cpu.max throttle window --
+        # cannot swing admission, but sustained divergence does.
+        self.correction = 0.9 * self.correction + 0.1 * ratio
+        # Floor of 1.0 is deliberate: the loop may only make estimates MORE
+        # conservative. An optimistic correction would let a lucky run of fast
+        # rounds widen batches until the bound breaks -- the exact failure this
+        # defends against. The ceiling stops one pathological measurement from
+        # wedging the engine into admitting nobody, ever.
+        self.correction = max(1.0, min(self.correction, MAX_CORRECTION))
+
+
+def build_batch(sessions, cost_curve, foreground_tab_id,
+                budget_ms=ROUND_LATENCY_BUDGET_MS):
+    """Compose one round by SPENDING A LATENCY BUDGET, not by filling slots.
+
+    Returns (decode_picks, prefill_chunks, estimated_ms).
+
+    §7's original slot-count split could never bind: BATCH_SIZE defaulted to
+    n_seq_max and admission is already capped at n_seq_max, so every runnable
+    session always fit in one batch. Worse, there is normally exactly ONE
+    foreground session, so a 50/50 split left foreground's spare slots to be
+    donated to background -- the reverse of the intended priority.
+
+    Batching also does not make mixed-depth sessions cheaper to share a round:
+    one batched llama_decode is a single synchronous pass whose cost is the SUM
+    of every member's KV-read, not the max. Measured: 4 sessions at depth 1500
+    gave 12.5 tok/s aggregate, 3.1 each -- worse than one session's solo 25.1
+    at that depth. A shallow foreground session sharing a round with a deep
+    background one inherits the deep one's cost.
+    """
+    runnable = [s for s in sessions
+                if s.state == SessionState.GENERATING and not s.cancelled]
+    pending = [s for s in sessions
+               if s.state == SessionState.PENDING and not s.cancelled]
+
+    # §5f: foreground is ONE tab id, re-read fresh every round, never cached.
+    # At most one TAB can be foreground by construction; >1 session only if two
+    # extensions share that tab.
+    fg = [s for s in runnable if s.key[1] == foreground_tab_id]
+    bg = [s for s in runnable if s.key[1] != foreground_tab_id]
+
+    picks, budget = [], float(budget_ms)
+    spent = 0.0
+
+    # Foreground first and UNCONDITIONALLY: the first one is admitted even if it
+    # alone exceeds the budget, or a deep foreground session could never run.
+    for s in fg:
+        c = cost_curve.cost_ms_worst(s.pos)
+        if not picks or c <= budget:
+            picks.append(s); budget -= c; spent += c
+
+    # AGING PASS -- before cheapest-first gets to pass over the same sessions
+    # again. Without it a moderately expensive bg session loses to the same
+    # cheaper ones every round forever: real starvation, merely moved from
+    # fg-vs-bg to bg-vs-bg.
+    picked = set(id(s) for s in picks)
+    aged = sorted([s for s in bg if s.rounds_excluded >= MAX_CONSECUTIVE_EXCLUSIONS],
+                  key=lambda s: -s.rounds_excluded)
+    for s in aged:
+        c = cost_curve.cost_ms_worst(s.pos)
+        # "or not picks" is a CORRECTION to §9a, not a restatement of it. §9a's
+        # prose says a deep session "simply runs alone in its own round,
+        # spending the whole budget on itself, which harms nobody else" -- but
+        # its code gives that unconditional-first-pick escape ONLY to
+        # foreground. Measured consequence: a background session costing more
+        # than the entire budget (100ms at pos 6000 vs a 50ms round) is excluded
+        # EVERY round forever, aging included, because c <= budget can never
+        # hold. 60/60 rounds excluded with no foreground even present.
+        #
+        # Granting aged background the same escape makes the prose true and
+        # bounds the overrun to one session's cost in a round where it runs
+        # alone -- which is exactly what §9a says should happen.
+        if c <= budget or not picks:
+            picks.append(s); picked.add(id(s)); budget -= c; spent += c
+
+    # NORMAL FILL -- cheapest-first. Arrival order (FIFO) would let whichever
+    # session asked first consume the whole budget alone, stranding several
+    # cheap sessions that would collectively have fit.
+    remaining = sorted([s for s in bg if id(s) not in picked],
+                       key=lambda s: cost_curve.cost_ms_worst(s.pos))
+    for s in remaining:
+        c = cost_curve.cost_ms_worst(s.pos)
+        if c <= budget:
+            picks.append(s); picked.add(id(s)); budget -= c; spent += c
+
+    for s in bg:
+        s.rounds_excluded = 0 if id(s) in picked else s.rounds_excluded + 1
+    for s in fg:
+        s.rounds_excluded = 0
+
+    # -- §9b: prefill fills whatever budget is LEFT ------------------------
+    # Decode is admitted first on purpose: a token owed to a session already
+    # mid-response is more latency-sensitive than starting a new one, and it
+    # keeps §9a's foreground guarantee untouched.
+    prefill_chunks = []
+    pending.sort(key=lambda s: s.key[1] != foreground_tab_id)
+    for s in pending:
+        remaining_toks = len(s.inbox_tokens) - s.prefill_offset
+        if remaining_toks <= 0:
+            continue
+        affordable = cost_curve.prefill_tokens_affordable(budget, s.pos)
+        n = min(remaining_toks, affordable)
+
+        # DIVERGENCE FROM §9b -- it says "if n < PREFILL_CHUNK_MIN and
+        # n < remaining: continue  # wait for a rounder budget". Taken
+        # literally that STARVES: if decode picks keep leaving less than a
+        # minimum chunk's worth of budget, the condition holds every round and
+        # the prompt is never prefilled at all. §9b bounds decode starvation
+        # with an aging pass but leaves prefill unbounded. Same remedy: after
+        # MAX_PREFILL_STALLS skipped rounds, force one minimum-size chunk
+        # through even though the budget does not cover it. That overruns the
+        # bound by at most one minimum chunk, which is finite and bounded --
+        # unlike never answering the user at all.
+        if n < PREFILL_CHUNK_MIN and n < remaining_toks:
+            s.prefill_stalls += 1
+            if s.prefill_stalls < MAX_PREFILL_STALLS:
+                continue
+            n = min(PREFILL_CHUNK_MIN, remaining_toks)
+        if n <= 0:
+            continue
+        s.prefill_stalls = 0
+        chunk = s.inbox_tokens[s.prefill_offset:s.prefill_offset + n]
+        prefill_chunks.append((s, chunk))
+        c = cost_curve.prefill_ms(n, s.pos)
+        budget -= c; spent += c
+
+    return picks, prefill_chunks, spent
