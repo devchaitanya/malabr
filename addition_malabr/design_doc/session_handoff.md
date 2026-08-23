@@ -1,7 +1,7 @@
 # MALABR Session Handoff — paste the prompt below into a new session
 
 This file is the durable record. The block in the fenced code section below is
-what to paste as your first message in a new Claude Code session to resume
+a summary to re-establish context when resuming
 seamlessly.
 
 ---

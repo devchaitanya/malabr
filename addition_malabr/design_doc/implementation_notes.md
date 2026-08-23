@@ -1,39 +1,22 @@
-# MALABR overnight autonomous run — live state file
+# MALABR Phase 1 — implementation notes
 
-Started 2026-08-23. Written by the /loop session so each 2-hourly iteration can
-resume after context is summarized. UPDATE THIS FILE EVERY CYCLE.
+Working notes kept alongside `phase1_design.md` while the Python side was
+built. Records (a) how far the build order has got, (b) facts established by
+measurement that should not be re-asserted without re-measuring, and (c) points
+where the design document turned out to be wrong or underspecified and an
+implementation decision had to be taken.
 
-## Standing permissions (granted by Chaitanya before starting)
+## Environment
 
-- Full plan INCLUDING deletions: create/edit engine.py, calibration.py,
-  protocol.py, runtime.py, config.py; gut supervisor.py; DELETE training.py and
-  storage.py; run standalone llama.cpp model tests.
-- Git: **commit locally each cycle, NEVER push.** He reviews and pushes himself.
-- Ambiguity: pick the most defensible option, document the assumption in a code
-  comment AND in the OPEN ASSUMPTIONS section below, keep building, report in
-  the morning. Do not halt.
-- Chromium build: permitted ONLY if all coding is genuinely finished and audits
-  are clean. **HARD CONSTRAINT: VS Code is an ancestor of the Claude session
-  (verified: claude -> code -> code -> gnome-shell). Killing it kills the loop.**
-  So the build is a TERMINAL action only, launched detached via setsid, and only
-  after everything else is complete. Default: do not build.
+- Python 3.10 conda environment; `llama-cpp-python` 0.3.34.
+- Test models: `addition_malabr/models/Qwen3-0.6B-Q8_0.gguf`,
+  `gemma-3-1b-it-Q4_K_M.gguf`.
+- `malabr_service/__init__.py` eagerly imports `runtime` -> `ML.Request` ->
+  `flatbuffers`, which breaks standalone testing of `engine.py`; `flatbuffers`
+  is not installed. Tests load `engine.py` by path until this is fixed.
+- Development machine is memory-constrained; use a small `n_ctx` in tests.
 
-## Environment (verified, do not re-derive)
-
-- Python: conda env root `/home/chaitu/Desktop/vscode/malabr/bin/python` (3.10),
-  llama-cpp-python 0.3.34. It is a conda ROOT, not a `venv/` subdir (the v2
-  handoff says venv — that is wrong).
-- Models: `addition_malabr/models/Qwen3-0.6B-Q8_0.gguf`, `gemma-3-1b-it-Q4_K_M.gguf`
-- `flatbuffers` is NOT installed in that env — the legacy path cannot import.
-- `malabr_service/__init__.py` eagerly imports runtime -> ML.Request ->
-  flatbuffers, which breaks standalone testing of engine.py. Tests load
-  engine.py by path via importlib until this is fixed.
-- Machine is memory-tight: ~473MB free RAM, swap 3.8/4.0GB. Use small n_ctx in
-  tests. Do not run large builds.
-- Scratchpad for temp files:
-  /tmp/claude-1000/-media-chaitu-chaitanya-malabr-src/bc5e2c87-55a9-4c8c-ab3e-98004848c50b/scratchpad
-
-## Build order (from §10a / handoff v4) — status
+## Build order — status
 
 1. [DONE] SlotAllocator + wipe-on-acquire        engine.py
 2. [DONE] chat template application (§6c) — ChatFormatter, model-agnostic
@@ -48,7 +31,7 @@ then:
 10.[ ] gut supervisor.py; DELETE training.py, storage.py
 11.[ ] §12 harness (31 numbered tests)
 
-## Verified facts from measurement (do not re-assert without re-measuring)
+## Verified facts from measurement
 
 - KV leak is REAL: slot reused without wipe still reports pos_max=12 for a
   13-token conversation. Wipe-on-acquire clears to -1.
@@ -61,12 +44,12 @@ then:
   CHECK-THEN-ACT: 120 IndexErrors / 160 acquires with a 2ms widened window and no
   lock; 0 with the lock. Symptom is a crash on a request that should have been a
   clean "no capacity" reject.
-- LESSON: the first race test PASSED against a deliberately broken lock-free
-  allocator. Weak tests look like passing tests. Every concurrency/scheduler test
-  MUST be run against a deliberately broken implementation to prove it has
-  detection power. This applies directly to §12 tests 52/55/62/63.
+- Concurrency and scheduler tests must be run against a deliberately broken
+  implementation to confirm they can fail at all. A first attempt at the slot
+  race test PASSED against a lock-free allocator, i.e. it had no detection
+  power. This applies directly to §12 tests 52/55/62/63.
 
-## OPEN ASSUMPTIONS (things the design doc did not settle; decided by me)
+## Design-document corrections and open decisions
 
 1. **§6c's incremental fragment is WRONG as written; replaced with a derived
    delta.** The doc says subsequent turns append a hardcoded
@@ -157,61 +140,3 @@ then:
    while Qwen3 flags SIX as end-of-generation (gemma-3 flags 3). Comparing
    against eos alone would miss the rest and run to the output cap.
    **Recommend correcting §5b.**
-
-## Cycle log
-
-- cycle 0 (start): SlotAllocator written + 15 checks passing; lock rationale
-  comment corrected after measurement disproved it.
-- cycle 6: protocol.py rewritten for the MALABR wire format (the inherited file
-  was entirely flatbuffers/numpy tensor code for the dead sklearn path, and
-  flatbuffers is not even installed). 6-field header with full validation,
-  payload bound enforced BEFORE recv_full, frame encode/decode, all four
-  control messages. Verified the header format byte-for-byte against
-  MServerUDS::GetHeaderPayload rather than against §10a's prose. Confirmed the
-  C++ really does reject opaque origins (malabr_api.cc:77) and added the second
-  gate anyway, since §10a itself says the peer may not be ours. 60 checks + 2
-  negative controls.
-- cycle 5: §9a/§9b scheduler + batched engine round. CostCurve (median vs
-  worst-observed), build_batch (fg unconditional, aging, cheapest-first),
-  chunked prefill, closed loop (EWMA, floor 1.0, ceiling 8.0). Engine now runs
-  ONE batched llama_decode carrying prefill chunks and decode tokens together.
-  THREE real bugs found: (a) §9a aging cannot rescue an over-budget session —
-  prose and code disagree; (b) §9b's chunk-min rule starves prefill outright;
-  (c) llama_get_logits_ith takes the BATCH index, not the ordinal among tokens
-  requesting logits — crashed with GGML_ASSERT(logits != nullptr). That last
-  one was latent while sampling used index -1; batching made it real.
-  Also fixed my own inconsistency: prefill_tokens_affordable returned 0 when
-  uncalibrated while the comment claimed one min chunk per round — an
-  uncalibrated engine would never prefill.
-  §12 tests 52/55/62 now have implementations + negative controls.
-- cycle 4: compaction (§8). Verified seq_rm/seq_add semantics against the real
-  model first (removes [p0,p1); seq_add(p0,-1,d) shifts everything >=p0).
-  Position-shift fix applied to turn boundaries, BOTH §6b snapshots, s.pos, and
-  formatter msg_index. Added the assertion §8 names but never wrote: nothing
-  live may sit strictly inside a dropped range. Input-cap gate 2 added.
-  Negative control proves the shift test has power — without the shift,
-  boundaries go non-contiguous AND the last one exceeds s.pos.
-  Found: §8 never mentions the formatter (same gap §6b had).
-- cycle 3: engine loop (Session/Engine), §6d Utf8Streamer, §8/PhaseD-G OutputCap,
-  §5d two sampling configs, per-session sampler (shared samplers would couple
-  sessions' RNG/penalty state — same bleed class as the KV slot). 29 engine
-  checks + regressions all green. TWO real holes found by tests, both caught by
-  guards written in earlier cycles: (a) Engine never called prepare(), so
-  assert_ready refused every first request — without that guard this was a
-  silent cross-session KV leak; (b) §6b/§6c rollback desync, caught by the
-  formatter prefix check. Also fixed verify_against_full()'s unstated
-  precondition (it compared against the wrong render after a completed
-  assistant turn and reported a false divergence).
-- cycle 2 (audit): found a REAL hole in both my code and §7 — the slot wipe ran
-  on connection threads, racing llama_decode on the engine thread. llama.h
-  guarantees thread-safety only for tokenization. Restructured into
-  acquire/release (bookkeeping, any thread) + prepare (engine thread) +
-  assert_ready (decode guard). 17 checks pass incl. a negative control proving
-  the guard test detects a stripped guard.
-- cycle 1: ChatFormatter + is_stop_token. Closed §6c's own stated-unverified
-  question: incremental == full render, and verified in TOKENS not just strings
-  (§6c only compared strings; BPE merges across boundaries — measured
-  tok("hell")+tok("o")=[56095,78] vs tok("hello")=[14990]). The turn split is
-  safe structurally because every delta begins on a special token, and special
-  tokens are hard BPE boundaries. Passes on Qwen3 AND gemma-3. Both negative
-  controls (corrupt _rendered, broken prefix) fire correctly.

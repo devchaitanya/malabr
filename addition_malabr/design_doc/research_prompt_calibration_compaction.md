@@ -1,6 +1,6 @@
 # Deep Research Prompt — Calibration & Compaction for MALABR
 
-Paste everything below into a fresh Claude session with web search / deep
+Research prompt for an assistant with web search and deep
 research enabled. It's built to skip ground already covered this session —
 read the "already known" list before researching, and don't spend budget
 re-surfacing it. The goal is to find what's *beyond* it.
