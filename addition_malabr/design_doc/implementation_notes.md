@@ -11,9 +11,10 @@ implementation decision had to be taken.
 - Python 3.10 conda environment; `llama-cpp-python` 0.3.34.
 - Test models: `addition_malabr/models/Qwen3-0.6B-Q8_0.gguf`,
   `gemma-3-1b-it-Q4_K_M.gguf`.
-- `malabr_service/__init__.py` eagerly imports `runtime` -> `ML.Request` ->
-  `flatbuffers`, which breaks standalone testing of `engine.py`; `flatbuffers`
-  is not installed. Tests load `engine.py` by path until this is fixed.
+- `malabr_service/__init__.py` now imports nothing at package import time.
+  It previously did `from .runtime import run_server`, dragging every importer
+  through `ML.Request` -> `flatbuffers` (not installed), which made `engine.py`
+  impossible to import standalone.
 - Development machine is memory-constrained; use a small `n_ctx` in tests.
 
 ## Build order — status
@@ -25,7 +26,7 @@ implementation decision had to be taken.
 5. [DONE] scheduler §9a/§9b (round budget, aging, chunked prefill, closed loop)
 then:
 6. [DONE] protocol.py — 6-field header, frames, payload bound, control msgs
-7. [ ] runtime.py — control route, reader thread
+7. [DONE] runtime.py — control route, reader thread, PID lock
 8. [ ] config.py  — n_ctx, n_seq_max, calibration path
 9. [ ] calibration.py — §11a phases A–G + Phase B-prefill
 10.[ ] gut supervisor.py; DELETE training.py, storage.py
@@ -140,3 +141,26 @@ then:
    while Qwen3 flags SIX as end-of-generation (gemma-3 flags 3). Comparing
    against eos alone would miss the rest and run to the output cap.
    **Recommend correcting §5b.**
+
+### Further corrections found while building runtime.py
+
+11. **The outbox must be per-REQUEST, not per-session.** §7 calls it "the
+    session's outbox". Under §6b's single-flight replace TWO handlers are
+    briefly alive: the superseded one waiting for its terminal frame and the
+    new one waiting for tokens. One shared queue means whichever polls first
+    steals the other's frames — the superseded client could receive the new
+    response, or hang until its 60s read timeout. Each request now owns a
+    queue; the engine writes to whichever is current, and the swap happens on
+    the engine thread AFTER the superseded terminal frame is written to the old
+    one.
+
+12. **`LIVE_TABS` must exempt `tab_id == -1`.** -1 is the documented
+    "not tab-scoped" value and can never appear in a list of live tabs, so a
+    naive "reap anything not in the list" reaps those sessions instantly, on
+    the very first reconciliation. Not mentioned in §5f.
+
+13. **Single-instance enforcement must check a PID before touching the
+    socket.** §10 already flags that the inherited delete-stale-socket pattern
+    is dangerous; the ordering is the specific part that matters. The socket is
+    only unlinked AFTER the pid lock confirms no live owner, otherwise a second
+    process can delete a live instance's socket and steal the path.

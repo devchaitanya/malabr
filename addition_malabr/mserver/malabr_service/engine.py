@@ -586,7 +586,15 @@ class Session:
         self.produced = 0                 # tokens emitted this response
         self.inbox_tokens = []            # prompt tokens awaiting prefill
         self.prefill_offset = 0
+        # PER-REQUEST, not per-session -- a correction to §7, which calls this
+        # "the session's outbox". Under §6b's single-flight replace TWO handlers
+        # are briefly alive: the superseded one waiting for its terminal frame,
+        # and the new one waiting for tokens. One shared queue means whichever
+        # polls first steals the other's frames -- the superseded client could
+        # receive the new response, or hang until its 60s read timeout. Each
+        # request gets its own queue; the engine writes to whichever is current.
         self.outbox = queue.Queue(maxsize=MAX_OUTBOX_TOKENS)
+        self.pending_outbox = None
         self.streamer = Utf8Streamer()
         self.sampler = None               # per-session: see Engine._make_sampler
         self._reply_bytes = bytearray()   # what the model produced this turn
@@ -739,6 +747,27 @@ class Engine:
             self.cancel(k, "cross-origin eviction")
         return doomed
 
+    def all_keys(self):
+        with self._reg_lock:
+            return [k for k, s in self._sessions.items()
+                    if s.state != SessionState.DEAD]
+
+    def keys_for_tab(self, tab_id):
+        with self._reg_lock:
+            return [k for k, s in self._sessions.items()
+                    if k[1] == tab_id and s.state != SessionState.DEAD]
+
+    def keys_for_extension(self, extension_id):
+        """Section 10's sweep: tear down EVERY session for one extension.
+
+        Tab-close handles one session at a time; without this, an uninstalled
+        extension's sessions would sit holding slots until their tabs happen to
+        close, which may be never.
+        """
+        with self._reg_lock:
+            return [k for k, s in self._sessions.items()
+                    if k[0] == extension_id and s.state != SessionState.DEAD]
+
     def cancel(self, key, reason):
         """Mark a session for teardown. Safe from any thread: sets flags only.
 
@@ -754,15 +783,23 @@ class Engine:
         return True
 
     def submit(self, key, text):
-        """Queue a new prompt. Section 6b: replaces any generation in flight."""
+        """Queue a new prompt and return THIS request's outbox.
+
+        Section 6b: replaces any generation in flight. Returns None if there is
+        no such session.
+        """
         with self._reg_lock:
             s = self._sessions.get(key)
         if s is None or s.state == SessionState.DEAD:
-            return False
+            return None
+        # The caller needs its queue reference immediately -- it will start
+        # blocking on it before the engine thread reaches _begin_turn.
+        outbox = queue.Queue(maxsize=MAX_OUTBOX_TOKENS)
+        s.pending_outbox = outbox
         # Do NOT touch pos or KV here -- that is engine-thread work. Only the
         # flag is set; the loop performs the rollback at its next top.
         s.pending_replace = text
-        return True
+        return outbox
 
     # -- engine thread ------------------------------------------------------
 
@@ -924,6 +961,12 @@ class Engine:
                 self._begin_turn(s, text)
 
     def _begin_turn(self, s, text):
+        # Swap in the queue this request's handler is already holding. Done here
+        # on the engine thread, AFTER any superseded terminal frame has been
+        # written to the OLD queue, so the two never mix.
+        if s.pending_outbox is not None:
+            s.outbox = s.pending_outbox
+            s.pending_outbox = None
         s.pos_before_request = s.pos            # snapshot 1 (section 6b)
         s.formatter_cp_before_request = s.formatter.checkpoint()
         s.inbox_tokens = s.formatter.user_turn(text)
