@@ -347,3 +347,115 @@ def is_stop_token(vocab, token):
     the model would run on until the output cap instead of ending the turn.
     """
     return bool(C.llama_vocab_is_eog(vocab, token))
+
+
+# ---------------------------------------------------------------------------
+# Section 6d -- UTF-8 safe streaming
+# ---------------------------------------------------------------------------
+
+class Utf8Streamer:
+    """Buffers token bytes so no frame ever splits a UTF-8 character.
+
+    Measured, not hypothetical: scanning the first 20,000 vocabulary entries,
+    282 tokens (~1.4%) produce bytes that are NOT valid UTF-8 standalone -- e.g.
+    token 94 -> b'\\xa1', one piece of a multi-byte character from BPE's
+    byte-level fallback. Emitting each token's bytes as produced means any
+    non-English text, many symbols, or emoji eventually splits a character
+    across two frames, and the browser-side decoder shows a replacement
+    character or throws.
+
+    So: accumulate bytes, emit only the prefix that decodes cleanly, and hold
+    the trailing partial bytes for the next token.
+    """
+
+    # A UTF-8 character is at most 4 bytes, so a legitimate partial sequence can
+    # never exceed 3 held bytes. Anything longer is genuinely malformed output
+    # rather than an incomplete character, and holding it forever would stall
+    # the stream silently -- flush it lossily instead of hanging.
+    MAX_HELD_BYTES = 3
+
+    def __init__(self):
+        self._buf = bytearray()
+
+    def push(self, raw):
+        """Add token bytes; return the text safe to send now (may be '')."""
+        self._buf.extend(raw)
+        # Find the longest prefix that is valid UTF-8. Decoding the whole buffer
+        # and catching the error tells us exactly where the good prefix ends,
+        # which is cheaper and more precise than scanning byte patterns.
+        try:
+            text = self._buf.decode("utf-8")
+            self._buf.clear()
+            return text
+        except UnicodeDecodeError as e:
+            good = self._buf[:e.start].decode("utf-8")
+            held = self._buf[e.start:]
+            if len(held) > self.MAX_HELD_BYTES:
+                # Not a partial character -- genuinely invalid bytes. Emit a
+                # replacement rather than holding them forever.
+                good += held.decode("utf-8", "replace")
+                held = bytearray()
+            self._buf = bytearray(held)
+            return good
+
+    def flush(self):
+        """End of stream: emit whatever is left, lossily if incomplete.
+
+        Trailing bytes here mean generation stopped mid-character. Showing a
+        replacement character is more honest than silently dropping output.
+        """
+        if not self._buf:
+            return ""
+        text = self._buf.decode("utf-8", "replace")
+        self._buf.clear()
+        return text
+
+
+# ---------------------------------------------------------------------------
+# Section 8 / section 11a Phase D+G -- output cap
+# ---------------------------------------------------------------------------
+
+# Phase G: one flat, conservative outer bound that applies ALWAYS, whatever the
+# calibrated curve says. The curve refines behaviour INSIDE this ceiling and can
+# never replace it -- otherwise corrupted calibration data yields a correspondingly
+# corrupted cap with no structural limit (section 11a Phase G).
+ABSOLUTE_CEILING = 512
+MIN_CAP = 64
+
+# Section 7: bounds the OUTPUT side, which none of the KV bounds cover. If the
+# reader stalls, the engine would otherwise produce into an unread queue forever.
+MAX_OUTBOX_TOKENS = 2 * ABSOLUTE_CEILING
+
+
+class OutputCap:
+    """Position-aware cap on tokens per response (section 8's context-growth fix).
+
+    A FLAT cap is wrong, and this is the one number the measurements most
+    directly contradict: decode runs at 48.3 tok/s at position 64 but 5.2 tok/s
+    at position 6000. A flat 512-token cap therefore costs ~11s early in a
+    conversation and ~98s deep into one -- the same number meaning wildly
+    different wall-clock time.
+
+    Calibration (Phase D) hands over a FINISHED table; the engine never derives
+    caps from raw curve data at runtime (section 12 test 31).
+    """
+
+    def __init__(self, table=None):
+        # table: sorted [(position, cap)]. None => no calibration data yet, so
+        # fall back to the floor rather than guessing high. Being too
+        # conservative truncates a reply; being too generous blows the latency
+        # budget the cap exists to enforce.
+        self._table = sorted(table) if table else None
+
+    def for_position(self, pos):
+        if self._table is None:
+            return MIN_CAP
+        cap = self._table[0][1]
+        for position, value in self._table:
+            if pos >= position:
+                cap = value
+            else:
+                break
+        # Phase G's ceiling is applied here too, not only at table-build time,
+        # so a corrupted or hand-edited table still cannot exceed it.
+        return max(MIN_CAP, min(int(cap), ABSOLUTE_CEILING))
