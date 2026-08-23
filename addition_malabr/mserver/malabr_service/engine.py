@@ -10,6 +10,7 @@ Built in the order the design mandates (most safety-critical first):
 Only step 1 is present so far.
 """
 
+import sys
 import threading
 
 import llama_cpp.llama_cpp as C
@@ -723,6 +724,15 @@ class Engine:
         self._running = False
         self._thread = None
         self.foreground_tab_id = -1         # section 5f: ONE key, not a per-session flag
+        # Section 5f degraded mode. If the control connection goes down, the
+        # last foreground value is FROZEN, and a frozen key naming a
+        # now-hidden tab would grant that tab §9a's unconditional admission
+        # every round, forever. After the timeout we degrade to "no
+        # foreground" -- every session treated uniformly -- which is the safe
+        # direction: it costs priority, it cannot break the latency bound.
+        self.control_connected = False
+        self.control_lost_at = time.time()
+        self.round_errors = 0
         # Held from calibration's Phase D output at startup, never re-derived
         # per round (§12 test 31).
         self.cost_curve = CostCurve()
@@ -762,6 +772,25 @@ class Engine:
             self.cancel(k, "cross-origin eviction")
         return doomed
 
+    def effective_foreground_tab_id(self):
+        """The foreground key the scheduler should actually use.
+
+        Read fresh every round, never cached. Returns -1 (no foreground) when
+        the control connection has been down longer than
+        STALE_VISIBILITY_TIMEOUT, because a stale key is worse than none.
+        """
+        if not self.control_connected and \
+                (time.time() - self.control_lost_at) > STALE_VISIBILITY_TIMEOUT:
+            return -1
+        return self.foreground_tab_id
+
+    def set_control_connected(self, connected):
+        if connected:
+            self.control_connected = True
+        elif self.control_connected:
+            self.control_connected = False
+            self.control_lost_at = time.time()
+
     def all_keys(self):
         with self._reg_lock:
             return [k for k, s in self._sessions.items()
@@ -782,6 +811,37 @@ class Engine:
         with self._reg_lock:
             return [k for k, s in self._sessions.items()
                     if k[0] == extension_id and s.state != SessionState.DEAD]
+
+    def wait_for_teardown(self, keys, timeout=2.0):
+        """Block until these sessions are actually gone, or the timeout expires.
+
+        Needed because eviction is deliberately ASYNCHRONOUS: cancel() only
+        sets a flag, and the engine thread does the KV work, because a
+        connection thread must never touch the model (§7). But admission runs
+        immediately on the connection thread, so without this the sequence
+            evict_other_origins(...) ; get_or_create(...)
+        rejects a cross-origin navigation with "no free session slots" while
+        the slot it needs is the condemned session's own, one round from being
+        released. Measured: with every slot occupied, the new-origin session
+        was refused and the slot appeared one round later.
+
+        Blocking a connection thread is fine here -- §7 calls the client pool a
+        waiting room, not compute, and it is sized well above n_seq_max.
+        """
+        if not keys:
+            return True
+        deadline = time.time() + timeout
+        pending = set(keys)
+        while time.time() < deadline:
+            with self._reg_lock:
+                alive = {k for k in pending
+                         if k in self._sessions
+                         and self._sessions[k].state != SessionState.DEAD}
+            if not alive:
+                return True
+            pending = alive
+            time.sleep(0.002)
+        return False
 
     def cancel(self, key, reason):
         """Mark a session for teardown. Safe from any thread: sets flags only.
@@ -831,7 +891,28 @@ class Engine:
 
     def _run(self):
         while self._running:
-            did_work = self._step()
+            try:
+                did_work = self._step()
+            except Exception as exc:
+                # An unhandled exception here used to kill the engine thread
+                # silently. The socket stays open and the server keeps
+                # ACCEPTING, so it looks healthy while doing nothing, and every
+                # session hangs until the browser's 60s read timeout. Failing
+                # loudly and continuing is strictly better: the round that blew
+                # up is lost, the rest of the engine keeps serving.
+                self.round_errors += 1
+                print(f"malabr: engine round failed ({type(exc).__name__}: {exc})",
+                      file=sys.stderr, flush=True)
+                if self.round_errors >= MAX_CONSECUTIVE_ROUND_ERRORS:
+                    # Something is systematically broken, not transient. Stop
+                    # rather than spin at full speed printing forever.
+                    print("malabr: too many consecutive engine failures, stopping",
+                          file=sys.stderr, flush=True)
+                    self._running = False
+                    return
+                time.sleep(0.01)
+                continue
+            self.round_errors = 0
             if not did_work:
                 time.sleep(0.001)
 
@@ -868,7 +949,7 @@ class Engine:
                 self.compact(s)
 
         decode_picks, prefill_chunks, estimated_ms = build_batch(
-            sessions, self.cost_curve, self.foreground_tab_id)
+            sessions, self.cost_curve, self.effective_foreground_tab_id())
         if not decode_picks and not prefill_chunks:
             return False
 
@@ -1237,6 +1318,15 @@ MAX_CONSECUTIVE_EXCLUSIONS = 5    # aging bound; no measured value yet
 PREFILL_CHUNK_MIN = 32            # below this, per-call overhead dominates
 MAX_PREFILL_STALLS = 5            # see build_batch -- not in §9b, see note there
 MAX_CORRECTION = 8.0              # §9b leaves this unnamed; see observe_round
+
+# §5f degraded mode: how long a dead control connection may go before the
+# foreground key is treated as stale and the engine falls back to uniform
+# treatment.
+STALE_VISIBILITY_TIMEOUT = 10.0
+
+# Consecutive failed engine rounds before giving up. Transient failures are
+# survivable; a systematic one should stop rather than spin.
+MAX_CONSECUTIVE_ROUND_ERRORS = 20
 
 
 class CostCurve:

@@ -131,6 +131,7 @@ class ControlReader:
             except OSError:
                 pass
 
+        self._engine.set_control_connected(True)
         try:
             while True:
                 try:
@@ -149,6 +150,10 @@ class ControlReader:
         finally:
             if self._conn is conn:
                 self._conn = None
+                # §5f: start the staleness clock. The browser reconnects with
+                # jitter and resyncs via LIVE_TABS + FOREGROUND, so this is a
+                # window, not a permanent state.
+                self._engine.set_control_connected(False)
             try:
                 conn.close()
             except OSError:
@@ -311,7 +316,12 @@ class MalabrServer:
         # DIFFERENT origin. This is what makes §5g work with no navigation
         # observer -- the next request from that tab simply carries a different
         # origin and the old session cannot survive it.
-        eng.evict_other_origins(env.extension_id, env.tab_id, env.origin)
+        doomed = eng.evict_other_origins(env.extension_id, env.tab_id, env.origin)
+        # Wait for the eviction we just asked for to actually complete. Without
+        # this, a cross-origin navigation is rejected for "no free slots" while
+        # the slot it needs belongs to the session we just condemned -- and it
+        # is exactly the full-capacity case where that hurts most.
+        eng.wait_for_teardown(doomed)
 
         session, created = eng.get_or_create(
             env.session_key, self._formatter_factory, self._output_cap)

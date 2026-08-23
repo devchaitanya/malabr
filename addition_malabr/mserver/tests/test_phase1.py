@@ -683,6 +683,67 @@ def t63_closed_loop():
            f"correction rose to {c.correction:.2f}; floor stayed {c2.correction:.2f}")
 
 
+def t58_degraded_mode():
+    alloc, e = FIX.new_engine()
+    e.set_control_connected(True)
+    e.foreground_tab_id = 7
+    trusted = e.effective_foreground_tab_id()
+    e.set_control_connected(False)
+    still = e.effective_foreground_tab_id()
+    e.control_lost_at = time.time() - (eng.STALE_VISIBILITY_TIMEOUT + 1)
+    degraded = e.effective_foreground_tab_id()
+    e.set_control_connected(True)
+    back = e.effective_foreground_tab_id()
+    record(58, "control down past the timeout degrades foreground to none",
+           trusted == 7 and still == 7 and degraded == -1 and back == 7
+           and e.foreground_tab_id == 7,
+           f"{trusted} -> {still} -> {degraded} -> {back}; raw key never mutated")
+
+
+def t64_eviction_at_full_capacity():
+    """Not in §12: found by auditing, and it broke §5g exactly under load."""
+    alloc, e = FIX.new_engine()
+    ext = "a" * 32
+    for i in range(FIX.n_seq_max):
+        e.get_or_create((ext, i, f"https://s{i}.test"), FIX.formatter,
+                        eng.OutputCap())
+    e.start()
+    try:
+        doomed = e.evict_other_origins(ext, 0, "https://evil.test")
+        done = e.wait_for_teardown(doomed)
+        s, _ = e.get_or_create((ext, 0, "https://evil.test"), FIX.formatter,
+                               eng.OutputCap())
+        record(64, "cross-origin navigation admitted even at FULL capacity",
+               done and s is not None and s.slot in alloc.pending_wipe,
+               f"evicted={len(doomed)} admitted={s is not None}")
+    finally:
+        e.stop()
+
+
+def t65_engine_survives_a_bad_round():
+    """Not in §12: an unhandled exception used to kill the engine thread
+    silently, leaving a server that accepts connections and serves nothing."""
+    alloc, e = FIX.new_engine()
+    calls = [0]
+    orig = eng.Engine._run_round
+
+    def bad(self):
+        calls[0] += 1
+        if calls[0] <= 3:
+            raise RuntimeError("synthetic round failure")
+        return False
+    eng.Engine._run_round = bad
+    try:
+        e.start()
+        time.sleep(0.3)
+        alive = e._thread.is_alive()
+    finally:
+        e.stop()
+        eng.Engine._run_round = orig
+    record(65, "engine thread survives an unexpected exception in a round",
+           alive and calls[0] > 3, f"rounds attempted={calls[0]}, alive={alive}")
+
+
 # ---------------------------------------------------------------------------
 # Declared SKIPs -- need a real browser, not omitted silently
 # ---------------------------------------------------------------------------
@@ -706,7 +767,6 @@ BROWSER_ONLY = [
     (49, "end-to-end focus-switch latency"),
     (51, "control connection reused, not reopened per push"),
     (57, "control-connection resync pushes foreground on reconnect"),
-    (58, "degraded mode: foreground None, budget still held"),
     (60, "navigation mid-generation rolls back without desyncing"),
     (61, "cross-origin navigation does not leak conversation"),
 ]

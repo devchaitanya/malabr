@@ -30,7 +30,7 @@ then:
 8. [DONE] config.py — startup-computed n_ctx/n_threads, calibration path
 9. [DONE] calibration.py — §11a phases A–G + Phase B-prefill
 10.[DONE] deleted supervisor.py/training.py/storage.py; wrote real app.py
-11.[DONE] §12 harness — 42 executed, 21 declared browser-only skips
+11.[DONE] §12 harness — 45 executed, 20 declared browser-only skips
 
 ## Verified facts from measurement
 
@@ -243,3 +243,39 @@ Three things worth recording:
 `cpu.max` quota timing) — listed explicitly in `tests/test_phase1.py` rather
 than silently omitted, so the gap between "Phase 1 done" and "Phase 1 tested
 here" stays visible.
+
+### Architecture audit findings (whole-system pass, after all 11 items)
+
+18. **Cross-origin eviction was spuriously rejected at full capacity — §5g's
+    mechanism broke exactly under load.** Eviction is deliberately
+    ASYNCHRONOUS (a connection thread must not touch the model, §7), but
+    admission ran immediately on the connection thread. Measured with every
+    slot occupied: the new-origin session was refused "no free session slots"
+    while the slot it needed belonged to the session just condemned, released
+    one round later. Self-inflicted, and worst in the case §5g exists for.
+    Fixed with `wait_for_teardown()`, bounded and blocking only a client-pool
+    thread, which §7 calls a waiting room rather than compute. Covered by new
+    test 64.
+
+19. **The engine thread had no crash protection.** An unhandled exception in
+    a round killed it silently. The socket stays open and the server keeps
+    ACCEPTING, so it looks healthy while serving nothing, and every session
+    hangs until the browser's 60s read timeout. Now logged and survived, with
+    a consecutive-failure cap so a systematic fault stops rather than spins.
+    Covered by new test 65.
+
+20. **`foreground_tab_id` had no staleness timeout (§5f, test 58).** If the
+    control connection died, the last value was frozen forever — and a frozen
+    key naming a now-hidden tab grants that tab §9a's UNCONDITIONAL admission
+    every round, permanently. The engine now degrades to "no foreground" after
+    `STALE_VISIBILITY_TIMEOUT`, which is the safe direction: it costs priority,
+    it cannot break the latency bound. The raw key is never mutated, so a
+    reconnect restores it immediately. Test 58 moves from browser-only to
+    executed.
+
+21. **One documented exception to "no model calls off the engine thread":**
+    `ChatFormatter.__init__` calls `llama_model_chat_template` from a
+    connection thread. Checked rather than assumed — it takes a `const
+    llama_model *` and returns `const char *`, a pure read of immutable model
+    metadata with no context involved, so concurrent reads are safe. Every
+    other model call is on the engine thread.
