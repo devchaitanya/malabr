@@ -41,7 +41,7 @@ resume after context is summarized. UPDATE THIS FILE EVERY CYCLE.
 4. [DONE] compaction (§8) + position-shift fix + input-cap gate 2
 5. [DONE] scheduler §9a/§9b (round budget, aging, chunked prefill, closed loop)
 then:
-6. [ ] protocol.py — 6-field header, frames, payload bound
+6. [DONE] protocol.py — 6-field header, frames, payload bound, control msgs
 7. [ ] runtime.py — control route, reader thread
 8. [ ] config.py  — n_ctx, n_seq_max, calibration path
 9. [ ] calibration.py — §11a phases A–G + Phase B-prefill
@@ -143,7 +143,16 @@ then:
    prefill unbounded. FIX: MAX_PREFILL_STALLS, then force one minimum chunk —
    overruns the bound by at most one chunk, which is finite, unlike never
    answering. **Recommend correcting §9b.**
-9. **Stop condition uses `llama_vocab_is_eog`, not `== llama_vocab_eos`.**
+9. **Where protocol.py actually broke is NOT what the handoff says.** The
+   handoff and §10a state it "splits the header into 3 fields and raises
+   otherwise". It used `split(",", 2)` — maxsplit=2 — so a 6-field header
+   yields exactly THREE parts, the count check PASSES, and it dies later on
+   `int()` of the merged remainder with "invalid payload size". Same outcome
+   (everything rejected), different mechanism. Minor, but the handoff's
+   description is wrong. Also: `mserver_uds.cc`'s comment claims origin may be
+   the literal "null" when opaque; `malabr_api.cc:77` rejects opaque origins
+   before that point, so the comment is stale.
+10. **Stop condition uses `llama_vocab_is_eog`, not `== llama_vocab_eos`.**
    §5b describes the EOS check as verified-correct, but eos() returns ONE token
    while Qwen3 flags SIX as end-of-generation (gemma-3 flags 3). Comparing
    against eos alone would miss the rest and run to the output cap.
@@ -153,6 +162,15 @@ then:
 
 - cycle 0 (start): SlotAllocator written + 15 checks passing; lock rationale
   comment corrected after measurement disproved it.
+- cycle 6: protocol.py rewritten for the MALABR wire format (the inherited file
+  was entirely flatbuffers/numpy tensor code for the dead sklearn path, and
+  flatbuffers is not even installed). 6-field header with full validation,
+  payload bound enforced BEFORE recv_full, frame encode/decode, all four
+  control messages. Verified the header format byte-for-byte against
+  MServerUDS::GetHeaderPayload rather than against §10a's prose. Confirmed the
+  C++ really does reject opaque origins (malabr_api.cc:77) and added the second
+  gate anyway, since §10a itself says the peer may not be ours. 60 checks + 2
+  negative controls.
 - cycle 5: §9a/§9b scheduler + batched engine round. CostCurve (median vs
   worst-observed), build_batch (fg unconditional, aging, cheapest-first),
   chunked prefill, closed loop (EWMA, floor 1.0, ceiling 8.0). Engine now runs
