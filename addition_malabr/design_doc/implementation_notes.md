@@ -279,3 +279,37 @@ here" stays visible.
     llama_model *` and returns `const char *`, a pure read of immutable model
     metadata with no context involved, so concurrent reads are safe. Every
     other model call is on the engine thread.
+
+## First compile of the browser-side C++
+
+The C++ had never been through a compiler. The first full build stopped after
+194 of 22,516 steps on a single failing target; two real defects came out of
+it, both fixed and each verified by recompiling the affected object.
+
+22. **`malabr_feature` in `chrome/browser/BUILD.gn` declared only `//base`.**
+    `malabr_manager.cc` includes browser-UI, extensions, content, sessions and
+    net headers, and the UI headers reach Skia transitively — so the target
+    failed with `'include/core/SkAlphaType.h' file not found`, which looks like
+    a Skia problem and is actually a missing dependency. Added `//chrome/common`,
+    `//components/sessions`, `//content/public/browser`, `//extensions/browser`,
+    `//extensions/common`, `//net` and `//skia`. `gn gen` confirms no circular
+    dependency, and the object now compiles. Sibling targets in the same file
+    (`display_file_feature`) already follow this pattern; this one had been left
+    behind.
+
+23. **§5a's visibility snippet does not compile on this Chromium revision.**
+    §5a shows
+    `rfh->GetVisibilityState() == content::PageVisibilityState::kVisible`.
+    There is no `content::PageVisibilityState`:
+    `RenderFrameHost::GetVisibilityState()` returns
+    `blink::mojom::PageVisibilityState`, and `render_frame_host.h` includes only
+    its `-forward.h`, so the type is incomplete at the use site. Using it would
+    need a blink mojom dependency `extensions/browser` should not take on.
+    Replaced with `web_contents->GetVisibility() == content::Visibility::VISIBLE`
+    — which is what §5a's own RESOLVED rule names, needs no new dependency, and
+    reuses the `WebContents` already fetched and null-checked a few lines above
+    for the tab id. **Recommend correcting §5a's code snippet.**
+
+All four malabr objects (`malabr_manager`, `malabr_api`, `mserver_uds`,
+`msocket_uds`) now compile. The remaining ~22,300 steps of the full build are
+untouched Chromium and have not been run to completion.

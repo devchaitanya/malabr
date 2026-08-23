@@ -152,6 +152,21 @@ source_set("malabr_feature") {
 
   deps = [
     "//base",
+    # chrome/common/chrome_features.h
+    "//chrome/common",
+    # SessionTabHelper::IdForTab -- browser-derived tab_id (phase1_design.md 5).
+    "//components/sessions",
+    # WebContents, Visibility, BrowserThread.
+    "//content/public/browser",
+    # ExtensionRegistry/ExtensionRegistryObserver -- the extension sweep (10).
+    "//extensions/browser",
+    "//extensions/common",
+    # net::Error from the UDS socket layer.
+    "//net",
+    # Pulled in transitively by chrome/browser/ui headers (Browser,
+    # TabStripModel). Without it SkColor.h cannot resolve its own
+    # include/core/ paths and the target fails to compile.
+    "//skia",
   ]
 }
 

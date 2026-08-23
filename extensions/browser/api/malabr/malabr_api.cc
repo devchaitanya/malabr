@@ -12,6 +12,7 @@
 #include "content/public/browser/browser_thread.h"
 #include "content/public/browser/render_frame_host.h"
 #include "content/public/browser/render_process_host.h"
+#include "content/public/browser/visibility.h"
 #include "content/public/browser/web_contents.h"
 #include "url/origin.h"
 #include "extensions/browser/event_router.h"
@@ -87,8 +88,18 @@ ExtensionFunction::ResponseAction MalabrGenerateFunction::Run() {
   // pushes corrections over the control connection; per section 6's ordering
   // rule this header value only seeds a session at creation and is ignored
   // for a session that already exists. See sections 5a, 5e, 6.
-  bool foreground = rfh->GetVisibilityState() ==
-                    content::PageVisibilityState::kVisible;
+  // WebContents::GetVisibility(), not RenderFrameHost::GetVisibilityState().
+  // The latter returns blink::mojom::PageVisibilityState, whose full
+  // definition is NOT available here -- render_frame_host.h includes only the
+  // -forward.h declaration -- so using it needs a blink mojom dependency this
+  // directory should not take on. WebContents::GetVisibility() returns
+  // content::Visibility, is already reachable, and is exactly the signal
+  // section 5a's resolved rule names.
+  //
+  // Reuses the web_contents already fetched and null-checked above for the
+  // tab id; re-fetching it here would shadow that one for no gain.
+  bool foreground =
+      web_contents->GetVisibility() == content::Visibility::VISIBLE;
 
   // Weak/safe handles, not raw pointers: the tab may die mid-stream (6a).
   render_frame_host_ = rfh->GetWeakDocumentPtr();
