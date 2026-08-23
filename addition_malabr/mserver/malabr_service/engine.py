@@ -319,6 +319,33 @@ class ChatFormatter:
         self._messages.append(("assistant", text))
         self._rendered += text
 
+    def _expected_render(self):
+        """The text that SHOULD currently be in the KV.
+
+        Phase-dependent, and the two cases are legitimately different -- an
+        earlier version compared against the wrong one and reported a false
+        divergence. After a completed assistant turn the KV holds the full
+        render up to and including the user turn plus the generated text, but
+        NOT the turn terminator (generation stops AT the end-of-generation
+        token and never decodes it) and NOT the next generation prompt.
+        """
+        if self._messages and self._messages[-1][0] == "assistant":
+            return self._apply(self._messages[:-1], True) + self._messages[-1][1]
+        return self._apply(self._messages, True)
+
+    def drop_messages(self, start, count):
+        """Remove messages that section 8 compaction evicted from the KV.
+
+        Section 8 specifies compaction entirely in terms of KV positions and
+        never mentions this. That is the same gap section 6b had: the formatter
+        is a SECOND per-session state holding the conversation, and a KV
+        mutation that does not update it leaves _rendered describing content the
+        model no longer has. The next turn is then built against a conversation
+        that does not exist.
+        """
+        del self._messages[start:start + count]
+        self._rendered = self._expected_render()
+
     # -- checkpoint / restore, for section 6b's rollback -----------------------
 
     def checkpoint(self):
@@ -346,20 +373,7 @@ class ChatFormatter:
         merge across boundaries, so string equality does not imply token
         equality. This checks the property that actually matters.
         """
-        # What _rendered SHOULD be depends on which phase the session is in, and
-        # the two are legitimately different -- an earlier version of this
-        # method compared against the wrong one and reported a false divergence.
-        #
-        # _rendered tracks exactly what is in the KV. After a completed
-        # assistant turn the KV holds the full render up to and including the
-        # user turn, plus the generated text -- but NOT the turn terminator
-        # (generation stops AT the end-of-generation token and never decodes it)
-        # and NOT the next generation prompt.
-        if self._messages and self._messages[-1][0] == "assistant":
-            expected = self._apply(self._messages[:-1], True) + self._messages[-1][1]
-        else:
-            expected = self._apply(self._messages, True)
-        truth = self._tokenize(expected)
+        truth = self._tokenize(self._expected_render())
         rebuilt = self._tokenize(self._rendered)
         if truth != rebuilt:
             raise TemplateError(
@@ -519,6 +533,39 @@ class OutboxFull(RuntimeError):
     """The client stopped reading. Section 7's policy is to disconnect it."""
 
 
+# Section 8 input cap. RESERVED_FOR_RESPONSE guarantees room is left for the
+# model to ANSWER, not merely to fit the question -- without it a prompt could
+# legally consume the entire budget and leave nothing to reply with.
+RESERVED_FOR_RESPONSE = 256
+
+
+class Turn:
+    """One complete exchange (user delta + generated response) in KV.
+
+    MUTABLE on purpose. Section 8's position-shift fix has to write corrected
+    positions back into entries still in the list; tuples cannot do that, and
+    the bug it fixes is precisely that other turns kept stale positions.
+
+    Range is [start, end): from the first token of the user delta to the last
+    token of the response. That boundary is not arbitrary -- every delta begins
+    with the terminator that CLOSES the preceding assistant block (a
+    consequence of section 6c deriving deltas from the template). So dropping a
+    whole exchange leaves the survivor's assistant block to be closed by the
+    NEXT surviving delta, and the result is well-formed with no repair step.
+    """
+
+    __slots__ = ("start", "end", "role", "msg_index")
+
+    def __init__(self, start, end, role, msg_index):
+        self.start = start
+        self.end = end
+        self.role = role
+        self.msg_index = msg_index      # index of the USER message in formatter
+
+    def __repr__(self):
+        return f"Turn({self.start},{self.end},{self.role},m={self.msg_index})"
+
+
 class Session:
     """One conversation, pinned to one KV slot.
 
@@ -556,6 +603,13 @@ class Session:
         # exactly the same moments as pos_before_request, or the two states
         # diverge -- see ChatFormatter.checkpoint().
         self.formatter_cp_before_request = None
+
+        # Section 8: completed exchanges, oldest first. turn_boundaries[0] is
+        # the ANCHOR -- kept always, because it carries the template's one-time
+        # system/tools preamble and StreamingLLM's finding that the first ~32
+        # tokens act as attention anchors whose loss degrades output sharply.
+        self.turn_boundaries = []
+        self.budget = 2048              # n_ctx / n_seq_max; set by the caller
 
         # Checked at the TOP of the loop, before dispatch -- same <=1-token
         # bound as tab-close cancellation, same flag pattern, no new machinery.
@@ -913,6 +967,15 @@ class Engine:
         if not toks:
             s.state = SessionState.IDLE
             return
+        # Section 8 gate 2: defense in depth at the actual point of no return.
+        # Gate 1 lives upstream at admission; one check point is a single point
+        # of failure, and this one is structurally unskippable by anything above
+        # it. If it ever fires, something upstream is broken -- that is the
+        # signal, not silent tolerance of the oversized input.
+        max_input = s.budget - RESERVED_FOR_RESPONSE
+        if len(toks) > max_input:
+            raise ValueError(
+                f"gate 1 bypassed: {len(toks)} tokens > max_input {max_input}")
         items = [(t, s.pos + i, s.slot, i == len(toks) - 1)
                  for i, t in enumerate(toks)]
         self._decode_batch(items)
@@ -961,6 +1024,11 @@ class Engine:
         s.produced += 1
 
     def _finish_turn(self, s, frame_type, reason):
+        # Record the completed exchange BEFORE the streamer is flushed, so the
+        # range covers exactly what went into the KV.
+        s.turn_boundaries.append(
+            Turn(s.pos_before_request, s.pos, "exchange",
+                 len(s.formatter._messages)))   # index of the user msg
         tail = s.streamer.flush()
         if tail:
             s.emit(FRAME_TOKEN, tail)
@@ -972,6 +1040,83 @@ class Engine:
         s.terminate(frame_type, reason)
         s.state = SessionState.IDLE
         s.produced = 0
+
+    # -- section 8: compaction ----------------------------------------------
+
+    COMPACT_TRIGGER = 0.95
+    TARGET_FREED_TOKENS = 512
+
+    def needs_compaction(self, s):
+        """Checked BEFORE a session enters a batch, never after.
+
+        A correctness requirement, not a safety margin: one batched decode can
+        advance several sessions' pos at once, so checking after the fact races
+        the batch -- session B could be one token from its ceiling and get
+        pushed past it before anything re-checked.
+        """
+        return s.pos >= s.budget * self.COMPACT_TRIGGER
+
+    def compact(self, s):
+        """Drop whole oldest exchanges, shifting EVERY live absolute position.
+
+        Returns tokens freed. False-y result means nothing was droppable, which
+        section 8 handles upstream by rejecting oversized input rather than
+        letting compaction fail and deciding afterwards.
+        """
+        # Keep the anchor (index 0) and the most recent exchange. The anchor
+        # carries the template preamble and the first ~32 tokens act as
+        # attention anchors whose loss degrades output sharply.
+        droppable = s.turn_boundaries[1:-1]
+        freed = 0
+        for turn in list(droppable):
+            if freed >= self.TARGET_FREED_TOKENS:
+                break
+            n = turn.end - turn.start
+            if n <= 0:
+                continue
+
+            # Invariant section 8 names but does not assert: nothing live may
+            # sit strictly INSIDE a dropped range. Droppable turns are
+            # fully-closed prior exchanges by construction, never the in-flight
+            # one a snapshot could reference. Assert it rather than assume it --
+            # a violation here silently rolls back to removed content.
+            for name, val in (("pos_before_request", s.pos_before_request),
+                              ("pos_before_generation", s.pos_before_generation)):
+                if turn.start < val < turn.end:
+                    raise RuntimeError(
+                        f"{name}={val} lies inside dropped range "
+                        f"[{turn.start},{turn.end}) -- compaction would corrupt it")
+
+            C.llama_memory_seq_rm(self._alloc._mem, s.slot, turn.start, turn.end)
+            C.llama_memory_seq_add(self._alloc._mem, s.slot, turn.end, -1, -n)
+
+            # THE FIX. Shifting s.pos alone is not enough -- every other absolute
+            # position recorded anywhere refers to the same shifted space, and
+            # each one that is missed silently points at the wrong content.
+            for other in s.turn_boundaries:
+                if other is turn:
+                    continue
+                if other.start >= turn.end:
+                    other.start -= n
+                    other.end -= n
+            if s.pos_before_request >= turn.end:
+                s.pos_before_request -= n
+            if s.pos_before_generation >= turn.end:
+                s.pos_before_generation -= n
+            s.pos -= n
+
+            # The formatter is the OTHER state holding this conversation, and
+            # section 8 never mentions it. Dropping KV without dropping the
+            # matching messages leaves _rendered describing content the model no
+            # longer has -- the same gap section 6b had with rollback.
+            s.formatter.drop_messages(turn.msg_index, 2)
+            for other in s.turn_boundaries:
+                if other is not turn and other.msg_index > turn.msg_index:
+                    other.msg_index -= 2
+
+            s.turn_boundaries.remove(turn)
+            freed += n
+        return freed
 
     def _token_bytes(self, tok):
         import ctypes

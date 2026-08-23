@@ -38,7 +38,7 @@ resume after context is summarized. UPDATE THIS FILE EVERY CYCLE.
 1. [DONE] SlotAllocator + wipe-on-acquire        engine.py
 2. [DONE] chat template application (§6c) — ChatFormatter, model-agnostic
 3. [DONE] single-threaded engine loop, EOS / output cap (+ §6d streamer, §8 cap)
-4. [ ] compaction (§8) + position-shift fix (EVERY live absolute position)
+4. [DONE] compaction (§8) + position-shift fix + input-cap gate 2
 5. [ ] scheduler §9a/§9b  (round budget, aging, chunked prefill, closed loop)
 then:
 6. [ ] protocol.py — 6-field header, frames, payload bound
@@ -113,7 +113,20 @@ then:
    and the next turn is built on a conversation the model never saw. Added
    `ChatFormatter.checkpoint()/restore()`, captured in `_begin_turn` at exactly
    the same moment as `pos_before_request`. **Recommend §6b naming this.**
-5. **Stop condition uses `llama_vocab_is_eog`, not `== llama_vocab_eos`.**
+5. **§8 compaction must drop the FORMATTER's messages too — same gap as §6b.**
+   §8 specifies compaction entirely as KV positions and never mentions the
+   rendered conversation. Dropping KV without dropping the matching messages
+   leaves `_rendered` describing content the model no longer has. Added
+   `ChatFormatter.drop_messages()`, called from `compact()`, plus `msg_index`
+   on each Turn (shifted like the positions). Verified: formatter render length
+   == s.pos after compaction (330 == 330). **Recommend §8 name this.**
+6. **Turn boundary = [user-delta start, response end), and that choice is
+   load-bearing.** §8 says "aligned to chat-template boundaries" without saying
+   which. This one works because every delta BEGINS with the terminator closing
+   the preceding assistant block (a consequence of §6c deriving deltas from the
+   template) — so dropping a whole exchange leaves the survivor's block closed
+   by the next surviving delta, well-formed with no repair step.
+7. **Stop condition uses `llama_vocab_is_eog`, not `== llama_vocab_eos`.**
    §5b describes the EOS check as verified-correct, but eos() returns ONE token
    while Qwen3 flags SIX as end-of-generation (gemma-3 flags 3). Comparing
    against eos alone would miss the rest and run to the output cap.
@@ -123,6 +136,14 @@ then:
 
 - cycle 0 (start): SlotAllocator written + 15 checks passing; lock rationale
   comment corrected after measurement disproved it.
+- cycle 4: compaction (§8). Verified seq_rm/seq_add semantics against the real
+  model first (removes [p0,p1); seq_add(p0,-1,d) shifts everything >=p0).
+  Position-shift fix applied to turn boundaries, BOTH §6b snapshots, s.pos, and
+  formatter msg_index. Added the assertion §8 names but never wrote: nothing
+  live may sit strictly inside a dropped range. Input-cap gate 2 added.
+  Negative control proves the shift test has power — without the shift,
+  boundaries go non-contiguous AND the last one exceeds s.pos.
+  Found: §8 never mentions the formatter (same gap §6b had).
 - cycle 3: engine loop (Session/Engine), §6d Utf8Streamer, §8/PhaseD-G OutputCap,
   §5d two sampling configs, per-session sampler (shared samplers would couple
   sessions' RNG/penalty state — same bleed class as the KV slot). 29 engine
