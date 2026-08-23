@@ -37,7 +37,7 @@ resume after context is summarized. UPDATE THIS FILE EVERY CYCLE.
 
 1. [DONE] SlotAllocator + wipe-on-acquire        engine.py
 2. [DONE] chat template application (§6c) — ChatFormatter, model-agnostic
-3. [ ] single-threaded engine loop, EOS / output cap
+3. [DONE] single-threaded engine loop, EOS / output cap (+ §6d streamer, §8 cap)
 4. [ ] compaction (§8) + position-shift fix (EVERY live absolute position)
 5. [ ] scheduler §9a/§9b  (round budget, aging, chunked prefill, closed loop)
 then:
@@ -94,7 +94,26 @@ then:
    The release-side "belt and braces" wipe was DROPPED — it would have to run on
    a connection thread, and wipe-on-acquire exists precisely because release
    cannot be trusted. **Recommend correcting §7.**
-3. **Stop condition uses `llama_vocab_is_eog`, not `== llama_vocab_eos`.**
+3. **§6b's rollback target for GENERATING is not usable; rolling the WHOLE
+   turn back instead.** §6b says a GENERATING session rolls back to
+   `pos_before_generation`, keeping the user message and the generation prompt
+   in KV. That is not a valid boundary: the KV at that point ends inside an
+   OPEN assistant block (the template's trailing generation prompt), so
+   appending a new user turn after it produces malformed structure — caught by
+   ChatFormatter's prefix check, not by reasoning. Rolling back to
+   `pos_before_request` is also what §6b's OWN stated rule requires ("a turn
+   only enters permanent context if it reaches EOS or the output cap"). A turn
+   is the user message AND its response, so both go. `pos_before_generation` is
+   still tracked — §8 compaction must shift it, and resume/regenerate would
+   need it. **Recommend correcting §6b.**
+4. **§6b and §6c were never reconciled: rollback must undo the FORMATTER too.**
+   §6b specifies rollback purely as KV positions; §6c later added a second
+   per-session state (the rendered conversation) that must roll back in
+   lockstep. Rolling one without the other desyncs the formatter from the KV
+   and the next turn is built on a conversation the model never saw. Added
+   `ChatFormatter.checkpoint()/restore()`, captured in `_begin_turn` at exactly
+   the same moment as `pos_before_request`. **Recommend §6b naming this.**
+5. **Stop condition uses `llama_vocab_is_eog`, not `== llama_vocab_eos`.**
    §5b describes the EOS check as verified-correct, but eos() returns ONE token
    while Qwen3 flags SIX as end-of-generation (gemma-3 flags 3). Comparing
    against eos alone would miss the rest and run to the output cap.
@@ -104,6 +123,16 @@ then:
 
 - cycle 0 (start): SlotAllocator written + 15 checks passing; lock rationale
   comment corrected after measurement disproved it.
+- cycle 3: engine loop (Session/Engine), §6d Utf8Streamer, §8/PhaseD-G OutputCap,
+  §5d two sampling configs, per-session sampler (shared samplers would couple
+  sessions' RNG/penalty state — same bleed class as the KV slot). 29 engine
+  checks + regressions all green. TWO real holes found by tests, both caught by
+  guards written in earlier cycles: (a) Engine never called prepare(), so
+  assert_ready refused every first request — without that guard this was a
+  silent cross-session KV leak; (b) §6b/§6c rollback desync, caught by the
+  formatter prefix check. Also fixed verify_against_full()'s unstated
+  precondition (it compared against the wrong render after a completed
+  assistant turn and reported a false divergence).
 - cycle 2 (audit): found a REAL hole in both my code and §7 — the slot wipe ran
   on connection threads, racing llama_decode on the engine thread. llama.h
   guarantees thread-safety only for tokenization. Restructured into

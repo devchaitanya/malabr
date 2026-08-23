@@ -319,6 +319,24 @@ class ChatFormatter:
         self._messages.append(("assistant", text))
         self._rendered += text
 
+    # -- checkpoint / restore, for section 6b's rollback -----------------------
+
+    def checkpoint(self):
+        """Capture enough state to undo an abandoned turn.
+
+        Section 6b specifies rollback purely as KV positions. It predates
+        section 6c, which introduced a SECOND piece of per-session state -- the
+        rendered conversation -- that must roll back in lockstep. Rolling back
+        one without the other desyncs the formatter from the KV, and the next
+        turn is built on a conversation the model never saw.
+        """
+        return (len(self._messages), len(self._rendered))
+
+    def restore(self, cp):
+        n_messages, n_rendered = cp
+        del self._messages[n_messages:]
+        self._rendered = self._rendered[:n_rendered]
+
     # -- self-check for the section 12 harness ---------------------------------
 
     def verify_against_full(self):
@@ -328,7 +346,20 @@ class ChatFormatter:
         merge across boundaries, so string equality does not imply token
         equality. This checks the property that actually matters.
         """
-        truth = self._tokenize(self._apply(self._messages, True))
+        # What _rendered SHOULD be depends on which phase the session is in, and
+        # the two are legitimately different -- an earlier version of this
+        # method compared against the wrong one and reported a false divergence.
+        #
+        # _rendered tracks exactly what is in the KV. After a completed
+        # assistant turn the KV holds the full render up to and including the
+        # user turn, plus the generated text -- but NOT the turn terminator
+        # (generation stops AT the end-of-generation token and never decodes it)
+        # and NOT the next generation prompt.
+        if self._messages and self._messages[-1][0] == "assistant":
+            expected = self._apply(self._messages[:-1], True) + self._messages[-1][1]
+        else:
+            expected = self._apply(self._messages, True)
+        truth = self._tokenize(expected)
         rebuilt = self._tokenize(self._rendered)
         if truth != rebuilt:
             raise TemplateError(
@@ -459,3 +490,493 @@ class OutputCap:
         # Phase G's ceiling is applied here too, not only at table-build time,
         # so a corrupted or hand-edited table still cannot exceed it.
         return max(MIN_CAP, min(int(cap), ABSOLUTE_CEILING))
+
+
+# ---------------------------------------------------------------------------
+# Sections 6 / 6b / 7 -- session state and the single-threaded engine loop
+# ---------------------------------------------------------------------------
+
+import queue
+import time
+
+
+# Response frame types on the wire (section 10a). Exactly one TERMINAL frame
+# (COMPLETE or ERROR) ends every request -- see terminate() for why that is
+# unconditional rather than best-effort.
+FRAME_TOKEN = 0
+FRAME_COMPLETE = 1
+FRAME_ERROR = 2
+
+
+class SessionState:
+    IDLE = "idle"
+    PENDING = "pending"          # prompt accepted, prefill not finished
+    GENERATING = "generating"    # producing response tokens
+    DEAD = "dead"                # torn down; never dispatched again
+
+
+class OutboxFull(RuntimeError):
+    """The client stopped reading. Section 7's policy is to disconnect it."""
+
+
+class Session:
+    """One conversation, pinned to one KV slot.
+
+    Identity is (extension_id, tab_id, origin) -- origin included because
+    without it, navigating a tab from a bank site to another site let the new
+    site's content script inherit a session still holding the bank
+    conversation (section 5g).
+    """
+
+    def __init__(self, key, slot, formatter, output_cap):
+        self.key = key
+        self.slot = slot
+        self.formatter = formatter
+        self.output_cap = output_cap
+
+        self.state = SessionState.IDLE
+        self.pos = 0                      # absolute KV position
+        self.produced = 0                 # tokens emitted this response
+        self.inbox_tokens = []            # prompt tokens awaiting prefill
+        self.prefill_offset = 0
+        self.outbox = queue.Queue(maxsize=MAX_OUTBOX_TOKENS)
+        self.streamer = Utf8Streamer()
+        self.sampler = None               # per-session: see Engine._make_sampler
+        self._reply_bytes = bytearray()   # what the model produced this turn
+
+        # Section 6b's TWO snapshots. One is not enough: pos_before_generation
+        # is right for interrupting a response already streaming, but a replace
+        # arriving DURING prefill of a large prompt has no earlier point to roll
+        # back to. Both are absolute positions, and section 8's compact() owns
+        # shifting them -- if that shift is ever skipped, rollback silently
+        # targets the wrong position.
+        self.pos_before_request = 0
+        self.pos_before_generation = 0
+        # The formatter's matching checkpoint. Must be captured and restored at
+        # exactly the same moments as pos_before_request, or the two states
+        # diverge -- see ChatFormatter.checkpoint().
+        self.formatter_cp_before_request = None
+
+        # Checked at the TOP of the loop, before dispatch -- same <=1-token
+        # bound as tab-close cancellation, same flag pattern, no new machinery.
+        self.pending_replace = None
+        self.cancelled = False
+        self.cancel_reason = None
+
+    # -- outbox ------------------------------------------------------------
+
+    def emit(self, frame_type, payload):
+        """Queue one frame. Raises OutboxFull if the reader has stalled.
+
+        Section 7 considered three policies and only one is defensible:
+        blocking the engine stalls the single shared execution slot for every
+        other session over one slow reader; dropping tokens silently corrupts
+        the response with no indication; so a stalled reader is treated exactly
+        like a dead one and routed through the ordinary teardown path.
+        """
+        try:
+            self.outbox.put_nowait((frame_type, payload))
+        except queue.Full:
+            raise OutboxFull(f"session {self.key} outbox full ({MAX_OUTBOX_TOKENS})")
+
+    def terminate(self, frame_type, payload=""):
+        """Emit the single terminal frame, bypassing the queue bound if needed.
+
+        Section 10a rule 2: a cancelled request MUST produce a terminal frame.
+        Without one the browser waits out its 60s SO_RCVTIMEO instead of ending
+        promptly. That makes this the one emission that must not fail because
+        the queue is full -- the whole point is to unblock a stuck reader, so
+        the bound that protects against a stuck reader cannot be allowed to
+        prevent it.
+        """
+        try:
+            self.outbox.put_nowait((frame_type, payload))
+        except queue.Full:
+            try:
+                self.outbox.get_nowait()          # make room by dropping oldest
+            except queue.Empty:
+                pass
+            try:
+                self.outbox.put_nowait((frame_type, payload))
+            except queue.Full:
+                pass                              # reader is gone entirely
+
+
+# Section 5d: two sampling configs, deliberately separate rather than one shared
+# default. Canary/fidelity tests (§12 tests 1,4,18,27,32,40) assume deterministic
+# output -- with any randomness they become probabilistic rather than pass/fail.
+# Real chat must NOT be greedy: argmax produces flat, repetitive text. The GGUF
+# carries no sampling defaults (25 metadata keys scanned, none sampling-related),
+# so these are chosen deliberately, not read from the model.
+SAMPLING_CHAT = {"temperature": 0.7, "top_p": 0.9, "top_k": 40}
+SAMPLING_DETERMINISTIC = {"temperature": 0.0}
+
+
+class Engine:
+    """The single engine thread. Owns the model context; nothing else touches it.
+
+    Single-threadedness is a NAMED INVARIANT, not incidental. It is what makes
+    mid-batch cancellation impossible by construction: a session flipped to
+    cancelled is excluded from selection entirely, before any batch is composed.
+    Any new periodic mechanism must run inside this loop, never on a timer
+    thread -- and that includes the slot wipe, which is why SlotAllocator splits
+    prepare() (engine thread) from acquire() (any thread).
+    """
+
+    def __init__(self, ctx, model, vocab, allocator, sampling=None, seed=0):
+        self._ctx = ctx
+        self._model = model
+        self._vocab = vocab
+        self._alloc = allocator
+        self._sampling = sampling if sampling is not None else SAMPLING_CHAT
+        self._seed = seed
+
+        self._sessions = {}                 # key -> Session
+        self._reg_lock = threading.Lock()   # guards _sessions only
+        self._running = False
+        self._thread = None
+        self.foreground_tab_id = -1         # section 5f: ONE key, not a per-session flag
+
+    # -- registry (called from connection threads) --------------------------
+
+    def get_or_create(self, key, formatter_factory, output_cap):
+        """Look up or create a session. ONE atomic critical section.
+
+        "Look up, and if absent create" must not be two steps -- two tabs
+        arriving together would otherwise both find nothing and both create,
+        and one of the two slots would leak with a session nobody can reach.
+        """
+        with self._reg_lock:
+            s = self._sessions.get(key)
+            if s is not None and s.state != SessionState.DEAD:
+                return s, False
+            slot = self._alloc.acquire()
+            if slot is None:
+                return None, False          # at capacity -- caller rejects
+            s = Session(key, slot, formatter_factory(), output_cap)
+            self._sessions[key] = s
+            return s, True
+
+    def evict_other_origins(self, ext_id, tab_id, origin):
+        """Section 10a rule 1: creating a session for (ext, tab, origin) tears
+        down any session with the same (ext, tab) and a DIFFERENT origin.
+
+        This is what makes cross-origin isolation work with no navigation
+        observer at all -- the next request from that tab simply carries a
+        different origin, and the old session cannot survive it.
+        """
+        with self._reg_lock:
+            doomed = [k for k in self._sessions
+                      if k[0] == ext_id and k[1] == tab_id and k[2] != origin]
+        for k in doomed:
+            self.cancel(k, "cross-origin eviction")
+        return doomed
+
+    def cancel(self, key, reason):
+        """Mark a session for teardown. Safe from any thread: sets flags only.
+
+        The actual KV work happens on the engine thread. That separation is the
+        same one SlotAllocator enforces, for the same reason.
+        """
+        with self._reg_lock:
+            s = self._sessions.get(key)
+        if s is None or s.state == SessionState.DEAD:
+            return False                    # defined no-op (section 10a)
+        s.cancelled = True
+        s.cancel_reason = reason
+        return True
+
+    def submit(self, key, text):
+        """Queue a new prompt. Section 6b: replaces any generation in flight."""
+        with self._reg_lock:
+            s = self._sessions.get(key)
+        if s is None or s.state == SessionState.DEAD:
+            return False
+        # Do NOT touch pos or KV here -- that is engine-thread work. Only the
+        # flag is set; the loop performs the rollback at its next top.
+        s.pending_replace = text
+        return True
+
+    # -- engine thread ------------------------------------------------------
+
+    def start(self):
+        self._running = True
+        self._thread = threading.Thread(target=self._run, name="malabr-engine",
+                                        daemon=True)
+        self._thread.start()
+
+    def stop(self, timeout=5.0):
+        self._running = False
+        if self._thread is not None:
+            self._thread.join(timeout)
+
+    def _run(self):
+        while self._running:
+            did_work = self._step()
+            if not did_work:
+                time.sleep(0.001)
+
+    def _step(self):
+        """One iteration. Returns True if any work was done.
+
+        Split out from _run so tests can drive the loop deterministically
+        instead of racing a background thread.
+        """
+        # Control flags FIRST, before anything is dispatched. This ordering is
+        # what gives cancellation its <=1-token bound and makes mid-batch
+        # cancellation unrepresentable.
+        self._apply_control()
+
+        s = self._pick()
+        if s is None:
+            return False
+        try:
+            if s.state == SessionState.PENDING:
+                self._prefill_step(s)
+            elif s.state == SessionState.GENERATING:
+                self._decode_step(s)
+            else:
+                return False
+        except OutboxFull as e:
+            # Stalled reader: same teardown path as a dead one (section 7).
+            s.terminate(FRAME_ERROR, "reader stalled")
+            self._teardown(s, str(e))
+        except SlotWipeError as e:
+            s.terminate(FRAME_ERROR, "slot integrity failure")
+            self._teardown(s, str(e))
+        return True
+
+    def _apply_control(self):
+        with self._reg_lock:
+            sessions = list(self._sessions.values())
+        for s in sessions:
+            if s.state == SessionState.DEAD:
+                continue
+            if s.cancelled:
+                self._roll_back_partial(s)
+                s.terminate(FRAME_ERROR, s.cancel_reason or "cancelled")
+                self._teardown(s, s.cancel_reason)
+                continue
+            if s.pending_replace is not None:
+                text = s.pending_replace
+                s.pending_replace = None
+                # Section 6b: the old turn is rolled back, never partially
+                # remembered. A turn enters permanent context ONLY by reaching
+                # EOS or the output cap.
+                if s.state in (SessionState.PENDING, SessionState.GENERATING):
+                    self._roll_back_partial(s)
+                    s.terminate(FRAME_ERROR, "superseded")
+                self._begin_turn(s, text)
+
+    def _begin_turn(self, s, text):
+        s.pos_before_request = s.pos            # snapshot 1 (section 6b)
+        s.formatter_cp_before_request = s.formatter.checkpoint()
+        s.inbox_tokens = s.formatter.user_turn(text)
+        s.prefill_offset = 0
+        s.produced = 0
+        s.streamer = Utf8Streamer()
+        s._reply_bytes = bytearray()
+        s.state = SessionState.PENDING
+
+    def _roll_back_partial(self, s):
+        """Undo a turn that did not finish. Engine thread only.
+
+        DIVERGES FROM SECTION 6b, deliberately. 6b rolls a GENERATING session
+        back to pos_before_generation, keeping the user message and the
+        generation prompt in KV. That is not a usable boundary: the KV at that
+        point ends inside an OPEN assistant block (the template's trailing
+        '<|im_start|>assistant\n'), so appending a new user turn after it
+        produces malformed structure -- which is exactly what the formatter's
+        prefix check caught.
+
+        Rolling back to pos_before_request instead is also what 6b's own stated
+        rule requires: "a turn only enters permanent context if it reaches EOS
+        or the output cap. Any other termination is rolled back -- never
+        partially remembered." A turn is the user message AND its response, so
+        both go. pos_before_generation is still tracked because section 8's
+        compaction has to shift it, and a future resume/regenerate feature
+        would need it.
+        """
+        if s.state not in (SessionState.PENDING, SessionState.GENERATING):
+            return
+        target = s.pos_before_request
+        if s.pos > target:
+            C.llama_memory_seq_rm(self._alloc._mem, s.slot, target, s.pos)
+            s.pos = target
+        # The formatter must roll back with the KV, not after it.
+        if s.formatter_cp_before_request is not None:
+            s.formatter.restore(s.formatter_cp_before_request)
+            s.formatter_cp_before_request = None
+        s.state = SessionState.IDLE
+
+    def _teardown(self, s, reason=None):
+        s.state = SessionState.DEAD
+        with self._reg_lock:
+            if self._sessions.get(s.key) is s:
+                del self._sessions[s.key]
+        try:
+            self._alloc.release(s.slot)
+        except ValueError:
+            pass                                # already released
+        if s.sampler is not None:
+            C.llama_sampler_free(s.sampler)
+            s.sampler = None
+
+    def _pick(self):
+        """Choose one runnable session. Replaced by §9a/§9b's scheduler later.
+
+        Cancelled and DEAD sessions are excluded HERE, before any dispatch --
+        that exclusion is what makes mid-batch cancellation impossible rather
+        than merely unlikely.
+        """
+        with self._reg_lock:
+            runnable = [s for s in self._sessions.values()
+                        if s.state in (SessionState.PENDING, SessionState.GENERATING)
+                        and not s.cancelled]
+        if not runnable:
+            return None
+        # Foreground first. One key on the registry, not a per-session boolean:
+        # a boolean can represent "5 tabs foreground at once", which is a state
+        # that must be unrepresentable (section 5f).
+        fg = [s for s in runnable if s.key[1] == self.foreground_tab_id]
+        return (fg or runnable)[0]
+
+    # -- the two model-touching steps ---------------------------------------
+
+    def _make_sampler(self, s):
+        """One sampler PER SESSION, never shared.
+
+        Not merely tidy: samplers carry state (RNG for dist, and any penalty
+        samplers added later). A shared chain would couple sessions' sampling
+        to each other, which is the same class of cross-session bleed the KV
+        slot wipe exists to prevent -- just in a different piece of state.
+        """
+        params = C.llama_sampler_chain_default_params()
+        chain = C.llama_sampler_chain_init(params)
+        temp = self._sampling.get("temperature", 0.0)
+        if temp <= 0.0:
+            C.llama_sampler_chain_add(chain, C.llama_sampler_init_greedy())
+        else:
+            if "top_k" in self._sampling:
+                C.llama_sampler_chain_add(
+                    chain, C.llama_sampler_init_top_k(int(self._sampling["top_k"])))
+            if "top_p" in self._sampling:
+                C.llama_sampler_chain_add(
+                    chain, C.llama_sampler_init_top_p(float(self._sampling["top_p"]), 1))
+            C.llama_sampler_chain_add(chain, C.llama_sampler_init_temp(float(temp)))
+            # Seed per session so a test can reproduce one session's stream
+            # without every session sharing one global sequence.
+            C.llama_sampler_chain_add(
+                chain, C.llama_sampler_init_dist(self._seed + (s.slot * 7919)))
+        return chain
+
+    def _decode_batch(self, items):
+        """items: [(token, pos, seq_id, want_logits)] -> logits index per item."""
+        n = len(items)
+        batch = C.llama_batch_init(n, 0, 1)
+        try:
+            batch.n_tokens = n
+            idx = {}
+            out_i = 0
+            for i, (tok, pos, seq, want) in enumerate(items):
+                batch.token[i] = tok
+                batch.pos[i] = pos
+                batch.n_seq_id[i] = 1
+                batch.seq_id[i][0] = seq
+                batch.logits[i] = 1 if want else 0
+                if want:
+                    idx[i] = out_i
+                    out_i += 1
+            rc = C.llama_decode(self._ctx, batch)
+            if rc != 0:
+                # Checked, not ignored. The handoff records two past cases where
+                # an unchecked return code produced physically impossible
+                # numbers; a silent decode failure here would desync s.pos from
+                # the KV and corrupt the conversation with no visible error.
+                raise RuntimeError(f"llama_decode failed rc={rc}")
+            return idx
+        finally:
+            C.llama_batch_free(batch)
+
+    def _prefill_step(self, s):
+        """Prefill the prompt. Chunking (§9b) replaces the all-at-once call."""
+        # The wipe happens HERE, on the engine thread, because llama.h
+        # guarantees thread-safety only for the tokenization API -- mutating KV
+        # from the connection thread that called acquire() would race
+        # llama_decode. Guarded so it fires only on a slot's first use: prepare()
+        # clears the WHOLE sequence, so running it on a later turn would erase
+        # the conversation instead of protecting it.
+        if s.slot in self._alloc.pending_wipe:
+            self._alloc.prepare(s.slot)
+        self._alloc.assert_ready(s.slot)     # refuses an unwiped slot
+        toks = s.inbox_tokens
+        if not toks:
+            s.state = SessionState.IDLE
+            return
+        items = [(t, s.pos + i, s.slot, i == len(toks) - 1)
+                 for i, t in enumerate(toks)]
+        self._decode_batch(items)
+        s.pos += len(toks)
+        s.prefill_offset = len(toks)
+
+        # Snapshot 2 (section 6b), taken once prefill completes and BEFORE the
+        # first output token, so an interrupted response rolls back to exactly
+        # the end of the prompt rather than into the middle of it.
+        s.pos_before_generation = s.pos
+        if s.sampler is None:
+            s.sampler = self._make_sampler(s)
+        s.state = SessionState.GENERATING
+
+    def _decode_step(self, s):
+        """Produce exactly ONE token, then return to the scheduler.
+
+        Returning after every single token IS the preemption mechanism --
+        nothing ever commits to more than one token, so a foreground request
+        arriving mid-background-generation waits at most one token (~50ms under
+        the Phase 1 cpu.max quota; ~23ms unthrottled).
+        """
+        self._alloc.assert_ready(s.slot)
+        tok = C.llama_sampler_sample(s.sampler, self._ctx, -1)
+
+        cap = s.output_cap.for_position(s.pos)
+        if is_stop_token(self._vocab, tok):
+            self._finish_turn(s, FRAME_COMPLETE, "eos")
+            return
+        if s.produced >= cap:
+            # The cap is a real completion, not an error: the turn DOES enter
+            # permanent context (section 6b's rule names EOS and the output cap
+            # as the two ways a turn is kept).
+            self._finish_turn(s, FRAME_COMPLETE, "cap")
+            return
+
+        C.llama_sampler_accept(s.sampler, tok)
+        raw = self._token_bytes(tok)
+        s._reply_bytes.extend(raw)
+        text = s.streamer.push(raw)
+        if text:
+            s.emit(FRAME_TOKEN, text)
+
+        self._decode_batch([(tok, s.pos, s.slot, True)])
+        s.pos += 1
+        s.produced += 1
+
+    def _finish_turn(self, s, frame_type, reason):
+        tail = s.streamer.flush()
+        if tail:
+            s.emit(FRAME_TOKEN, tail)
+        # Record what the model actually produced so the formatter's notion of
+        # the conversation matches the KV exactly. Skipping this would make the
+        # NEXT turn's delta wrong -- silently, with no error.
+        s.formatter.assistant_generated(
+            bytes(s._reply_bytes).decode("utf-8", "replace"))
+        s.terminate(frame_type, reason)
+        s.state = SessionState.IDLE
+        s.produced = 0
+
+    def _token_bytes(self, tok):
+        import ctypes
+        buf = (ctypes.c_char * 256)()
+        n = C.llama_token_to_piece(self._vocab, tok, buf, 256, 0, True)
+        if n < 0:
+            raise RuntimeError(f"llama_token_to_piece failed ({n})")
+        return buf.raw[:n]
