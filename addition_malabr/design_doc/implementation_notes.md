@@ -313,3 +313,27 @@ it, both fixed and each verified by recompiling the affected object.
 All four malabr objects (`malabr_manager`, `malabr_api`, `mserver_uds`,
 `msocket_uds`) now compile. The remaining ~22,300 steps of the full build are
 untouched Chromium and have not been run to completion.
+
+24. **Cold start is ~130s, not the ~13s §10 assumes, and nothing retried the
+    connect.** Measured by starting `app.py` with the SHIPPED DEFAULTS
+    (n_ctx=16384, n_seq_max=8, no cached calibration) rather than the reduced
+    settings every earlier test used: the socket appears after **130 seconds**.
+    §10 estimates "~13s (model load + calibration)" — a 10x underestimate, with
+    calibration dominating. Once its result is cached on disk later starts are
+    quick, but a fresh profile pays the full cost.
+
+    Worse, §10 also requires "a short retry-with-backoff inside `Send()`'s
+    `Connect()`" and that was **never implemented**: `MServerUDS::Send` called
+    `Connect()` exactly once, so every `generate()` issued during those 130
+    seconds failed outright. The jittered backoff that does exist covers only
+    the control connection, not request sockets. Added a 180s jittered retry
+    budget sized from the measurement rather than from the estimate.
+    **Recommend correcting §10's cold-start figure.**
+
+    Worth revisiting later: §11c's own audit says isolation and
+    browser-protection do NOT depend on calibration, only conversation length
+    and speed do. So the server could bind immediately with the conservative
+    fallback curve and calibrate in the background, swapping the measured curve
+    in when ready. Not done here because calibration and the engine would then
+    share the model context concurrently, which is exactly the thread-safety
+    problem correction 2 exists to prevent.

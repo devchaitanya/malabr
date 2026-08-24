@@ -2,9 +2,13 @@
 
 #include <arpa/inet.h>
 
+#include <algorithm>
 #include <string>
 
 #include "base/logging.h"
+#include "base/rand_util.h"
+#include "base/threading/platform_thread.h"
+#include "base/time/time.h"
 #include "extensions/browser/api/malabr/msocket_uds.h"
 #include "extensions/common/extension_features.h"
 #include "net/base/net_errors.h"
@@ -26,6 +30,15 @@ constexpr uint8_t kFrameError = 2;
 // A co-resident process with direct UDS access could otherwise ask us to
 // allocate arbitrary memory (section 10's response_len bound).
 constexpr uint32_t kMaxFramePayload = 1024 * 1024;  // 1 MiB
+
+// Connect retry budget. Sized from a MEASURED cold start, not an estimate:
+// with the shipped defaults and no cached calibration the server takes ~130s
+// to bind its socket. A budget shorter than that turns "the server is still
+// starting" into a user-visible failure on the first message after launch.
+constexpr int kConnectRetryBudgetSeconds = 180;
+constexpr int kConnectRetryInitialMs = 100;
+constexpr int kConnectRetryMaxDelaySeconds = 3;
+constexpr int kConnectRetryJitterMs = 250;
 
 // How long to wait for ONE frame before giving up (SO_RCVTIMEO).
 //
@@ -76,10 +89,38 @@ bool MServerUDS::SendStreaming(const std::string& prompt,
   base::FilePath path(socket_path_);
   MSocketUDS socket(path.value());
 
-  int result = socket.Connect();
-  if (result != net::OK) {
-    error_msg = "connect failed: " + std::to_string(result);
-    return false;
+  // Retry with jittered backoff. Section 10 requires this and it was missing:
+  // Connect() was attempted exactly once, so every generate() issued before
+  // the server finished starting failed outright.
+  //
+  // The window matters more than section 10 assumed. It estimated a ~13s cold
+  // start (model load plus calibration). Measured with the shipped defaults
+  // (n_ctx=16384, n_seq_max=8, no cached calibration) the server needs ~130s
+  // before it binds the socket -- roughly 10x that. Calibration dominates;
+  // once its result is cached on disk, later starts are quick.
+  //
+  // Jitter, not a fixed interval: several tabs sending in the first seconds of
+  // a cold start would otherwise retry in lockstep and synchronise into a
+  // burst the moment the server becomes ready (section 10).
+  int result = net::ERR_FAILED;
+  base::TimeDelta delay = base::Milliseconds(kConnectRetryInitialMs);
+  const base::TimeTicks deadline =
+      base::TimeTicks::Now() + base::Seconds(kConnectRetryBudgetSeconds);
+  while (true) {
+    result = socket.Connect();
+    if (result == net::OK) {
+      break;
+    }
+    if (base::TimeTicks::Now() >= deadline) {
+      error_msg = "connect failed after retrying for " +
+                  std::to_string(kConnectRetryBudgetSeconds) +
+                  "s: " + std::to_string(result);
+      return false;
+    }
+    const base::TimeDelta jitter =
+        base::Milliseconds(base::RandInt(0, kConnectRetryJitterMs));
+    base::PlatformThread::Sleep(delay + jitter);
+    delay = std::min(delay * 2, base::Seconds(kConnectRetryMaxDelaySeconds));
   }
 
   // Bound every recv() on this connection. Without it, a wedged server means
