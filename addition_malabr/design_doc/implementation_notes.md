@@ -337,3 +337,61 @@ untouched Chromium and have not been run to completion.
     in when ready. Not done here because calibration and the engine would then
     share the model context concurrently, which is exactly the thread-safety
     problem correction 2 exists to prevent.
+
+25. **The aggregate CPU ceiling is never applied — the easy half of the two-layer
+    cap is the missing one.** cgroups are process-granular; they bound what the
+    whole inference process may take and cannot see inside it, because a
+    `seq_id` is not a process. That asymmetry is the project's premise: the OS
+    supplies the outer ceiling, MALABR divides what sits inside it.
+
+    §11 requires BOTH: "a real cgroup cpu.max quota on the process, AND set
+    n_threads to match... setting one without the other is the nonlinear-loss
+    regime measured above." Only `n_threads` is implemented. `config.py`
+    computes `quota_pct`, calibration records it, comments throughout refer to
+    "the cgroup limit" — but nothing calls `systemd-run --scope -p CPUQuota=`
+    or writes `cpu.max`, and `run_malabr.sh` does not either. So CPU is bounded
+    today only by `n_threads=3`, a soft limit: three threads can saturate three
+    of four cores and the kernel will not intervene.
+
+    The mechanism itself is verified working on this machine, no root needed:
+    an unthrottled busy loop uses 99% CPU; the same loop under
+    `systemd-run --user --scope -p CPUQuota=25%` uses 25%, with wall time
+    unchanged. Note `cgroup.controllers` in our own scope lists only
+    `memory pids`, so writing `cpu.max` directly is not possible — the
+    `cpu` controller is not delegated. systemd-run is the working path.
+
+    NOT implemented here because the fix touches process lifecycle:
+    `MalabrManager` spawns `python3 app.py` and later calls `Terminate(pid)` on
+    that handle, so re-execing under a transient scope changes the PID and the
+    handle may no longer reach the real process. Needs a termination test
+    alongside it. **Recommend §11 note that only half the cap is built.**
+
+26. **Memory needs no cgroup, and that is a structural result rather than an
+    omission.** §11 measured RSS flat (~1139MB) from 1 to 8 resident sessions:
+    `n_ctx` is a single fixed allocation at startup with no runtime path to
+    grow. A `memory.max` on top would be redundant, since the allocation cannot
+    exceed itself. Memory is therefore capped exactly at BOTH granularities —
+    aggregate by construction, per-session by the `n_ctx / n_seq_max` budget
+    plus compaction at 95%. CPU is the asymmetric case: the per-session
+    division exists, the aggregate ceiling does not.
+
+27. **Resource monopolisation belongs in §11c's calibration-INDEPENDENT column.**
+    §11c lists isolation and browser-protection as not depending on
+    calibration, and conversation length and speed as depending on it.
+    Monopolisation resistance belongs with the former, and this was measured
+    rather than argued. One session at position 4000 against five shallow ones,
+    300 rounds, cost model swept across a 1000x error range:
+
+        accurate              deep session took  9.1% of slots, nobody starved
+        10x too optimistic                      16.7%,           nobody starved
+        100x too pessimistic                    16.9%,           nobody starved
+        no calibration at all                   18.0%,           nobody starved
+
+    Fair share is 16.7%. What the cost model's accuracy actually buys is
+    proportional charging of expensive sessions (the accurate run gives the deep
+    session LESS than fair share, correctly); as the model degrades the
+    scheduler stops discriminating and converges to round-robin. It never
+    permits monopolisation, because the anti-monopolisation property is
+    structural: the loop yields after every single token, `ABSOLUTE_CEILING`
+    bounds one response, and the aging pass counts rounds rather than
+    milliseconds. None of those take a calibration input.
