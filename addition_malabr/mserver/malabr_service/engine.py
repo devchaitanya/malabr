@@ -1216,6 +1216,13 @@ class Engine:
             s.outbox = s.pending_outbox
             s.pending_outbox = None
         s.pos_before_request = s.pos            # snapshot 1 (section 6b)
+        # Snapshot 2 is set for real when prefill completes (see _run_round). Pin
+        # it to the request boundary until then: left holding the PREVIOUS turn's
+        # value it points inside an already-closed exchange, and if the shared-KV
+        # aggregate guard's compact(keep_recent=False) drops that exchange while
+        # this turn is still PENDING, the stale position lands inside the dropped
+        # range and trips compact()'s corruption assert -- wedging the round.
+        s.pos_before_generation = s.pos
         s.formatter_cp_before_request = s.formatter.checkpoint()
         s.inbox_tokens = s.formatter.user_turn(text)
         # Section 8 gate 2: defense in depth at the point of no return. Gate 1

@@ -26,6 +26,16 @@ Claude/Anthropic attribution in commits. Server: hand-run from
    and the compaction asserts never trip. Drive: build a session to several
    turns, start a new turn (PENDING), force aggregate pressure, then supersede
    or roll back -- does it land on the right position?
+   -- FIXED. `_begin_turn` left `pos_before_generation` holding the PREVIOUS
+   turn's value through the PENDING window. When the aggregate guard's
+   `compact(keep_recent=False)` last resort dropped that finished exchange while
+   the next turn was still PENDING (exactly 2 turn_boundaries), the stale
+   position sat inside the dropped range and tripped compact()'s corruption
+   assert -- the RuntimeError abandoned the round and it retried forever,
+   wedging the pool. Fix: pin `pos_before_generation = pos_before_request` at
+   turn start; prefill completion still overwrites it with the real value.
+   Regression: test 40c. `pos_before_request` and `formatter_cp_before_request`
+   were already correct.
 
 2. **Shared-KV x §8 compaction snapshot staleness.** §8 lists the absolute
    positions compaction must shift. The aggregate guard compacts a DIFFERENT

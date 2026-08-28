@@ -522,6 +522,37 @@ def t40b_shared_kv_aggregate_guard():
            f"big {big_before}->{sb.pos}, small {small_before}->{ss.pos}, fair={fair}")
 
 
+def t40c_agg_guard_last_resort_on_pending_turn():
+    """Shared-KV x 6b: the aggregate guard's compact(keep_recent=False) can drop
+    the last COMPLETED exchange of a session whose NEXT turn is still PENDING.
+    pos_before_generation must not still hold that finished turn's value -- left
+    stale it lands inside the dropped range and trips compact()'s corruption
+    assert, abandoning the round forever."""
+    alloc, e = FIX.new_engine(shared_kv=True)
+    k = key(tab=1)
+    s, _ = e.get_or_create(k, FIX.formatter, eng.OutputCap([(0, 8)]))
+    ask(e, k, "Say hello.")
+    ask(e, k, "Say there.")            # two boundaries: anchor + one droppable
+    e.submit(k, "word " * 40)
+    e._apply_control()                 # _begin_turn runs; session now PENDING
+    pinned = s.pos_before_generation == s.pos_before_request
+
+    e._n_ctx, e._agg_margin, e._fair_share = s.pos - 4, 0, 8
+    raised = None
+    try:
+        e._relieve_aggregate_pressure([s])
+    except RuntimeError as ex:
+        raised = str(ex)
+
+    consistent = (raised is None
+                  and s.pos_before_generation == s.pos_before_request == s.pos
+                  and s.turn_boundaries[-1].end == s.pos)
+    record("40c", "aggregate guard's last-resort compaction survives a PENDING next turn",
+           pinned and consistent,
+           f"pinned={pinned} raised={raised} pbg={s.pos_before_generation} "
+           f"pbr={s.pos_before_request} pos={s.pos} end={s.turn_boundaries[-1].end}")
+
+
 def t41_phase_c_is_real():
     import inspect
     src = inspect.getsource(cal.phase_c_joint_worst_case)
