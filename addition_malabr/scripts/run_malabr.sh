@@ -63,12 +63,18 @@ export MALABR_PYTHON
 MALABR_SHARED_KV="${MALABR_SHARED_KV:-1}"
 export MALABR_SHARED_KV
 
-# Cooperative CPU throttle (phase1_design.md 11). 0<d<=1: the engine sleeps
-# proportionally after each round so average CPU lands near n_threads*d,
-# smoothly, with no cgroup. 1.0 (default) = flat out. Try 0.5 if inference
-# makes the machine feel unresponsive; it roughly halves token rate.
+# CPU governance (phase1_design.md 11), two layers:
+#   MALABR_CPU_DUTY  0<d<=1  -- PROGRESSIVE: the engine sleeps proportionally
+#     after each round so average CPU lands near n_threads*d, smoothly. 1.0
+#     (default) = flat out. Try 0.5 if inference makes the machine feel slow.
+#   MALABR_CPU_MAX   e.g. "2" (cores) or "150%"  -- HARD: the server moves its
+#     own pid into a transient systemd scope with a kernel-enforced cpu.max
+#     quota. A spike or a bug cannot cross it. Unset = no hard cap. Needs a
+#     user systemd + busctl; best-effort, falls back to duty-only.
 MALABR_CPU_DUTY="${MALABR_CPU_DUTY:-1.0}"
 export MALABR_CPU_DUTY
+MALABR_CPU_MAX="${MALABR_CPU_MAX:-}"
+export MALABR_CPU_MAX
 
 # Separate profile so experiments never disturb a real browsing profile, and
 # so a run can be reset by deleting one directory.

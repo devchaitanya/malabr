@@ -15,6 +15,7 @@ Startup order matters and is not arbitrary:
 """
 
 import os
+import subprocess
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -25,6 +26,64 @@ from malabr_service import calibration as cal
 from malabr_service import engine as eng
 from malabr_service import runtime as rt
 from malabr_service.config import load_config
+
+
+def apply_cpu_ceiling():
+    """HARD CPU cap (§11): move THIS process into a transient systemd scope with
+    a cpu.max quota, kernel-enforced.
+
+    MALABR_CPU_MAX is a core count ("1.5") or a percent ("150%"). Unset -> no
+    cap. This is the ceiling a spike or a bug cannot cross; MALABR_CPU_DUTY is
+    the smooth throttle that normally keeps usage well below it.
+
+    Why a self-move via busctl and not `systemd-run --scope python app.py`: that
+    leaves systemd-run as the parent and python as a child IN the scope, and
+    MalabrManager's Terminate(pid) on the parent does NOT propagate to python
+    (tested). Moving our OWN pid into the scope keeps the pid MalabrManager
+    tracks, has no intermediary to leak, and the empty scope is GC'd when we
+    exit. cpu is not delegated to our starting scope, so writing cpu.max
+    directly is impossible; systemd (the cgroup manager) enables the controller
+    when a CPU property is set on the new scope.
+
+    Best-effort: any failure (no busctl, not under a user systemd, denied) logs
+    and continues unthrottled -- the duty throttle still applies.
+    """
+    raw = (os.getenv("MALABR_CPU_MAX") or "").strip()
+    if not raw:
+        return
+    try:
+        usec_per_sec = (int(float(raw[:-1]) * 10000) if raw.endswith("%")
+                        else int(float(raw) * 1_000_000))
+        if usec_per_sec <= 0:
+            return
+    except ValueError:
+        print(f"malabr: ignoring malformed MALABR_CPU_MAX={raw!r}",
+              file=sys.stderr, flush=True)
+        return
+
+    if "malabr-cpu" in open("/proc/self/cgroup").read():
+        return                      # already scoped (e.g. after a model-switch re-exec)
+
+    pid = os.getpid()
+    try:
+        r = subprocess.run(
+            ["busctl", "--user", "call", "org.freedesktop.systemd1",
+             "/org/freedesktop/systemd1", "org.freedesktop.systemd1.Manager",
+             "StartTransientUnit", "ssa(sv)a(sa(sv))",
+             f"malabr-cpu-{pid}.scope", "fail",
+             "2",
+             "PIDs", "au", "1", str(pid),
+             "CPUQuotaPerSecUSec", "t", str(usec_per_sec),
+             "0"],
+            capture_output=True, text=True, timeout=10)
+        if r.returncode == 0:
+            print(f"malabr: CPU ceiling {raw} applied "
+                  f"(cpu.max quota {usec_per_sec}us/s)", file=sys.stderr, flush=True)
+        else:
+            print(f"malabr: CPU ceiling not applied: {r.stderr.strip()}",
+                  file=sys.stderr, flush=True)
+    except (OSError, subprocess.SubprocessError) as exc:
+        print(f"malabr: CPU ceiling not applied ({exc})", file=sys.stderr, flush=True)
 
 
 def build(cfg, quick_calibration=False):
@@ -92,6 +151,7 @@ def build(cfg, quick_calibration=False):
 
 
 def main():
+    apply_cpu_ceiling()             # before anything heavy, so calibration is capped too
     cfg = load_config()
     quick = os.getenv("MALABR_QUICK_CALIBRATION") == "1"
     model = ctx = engine = None
