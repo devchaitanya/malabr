@@ -395,3 +395,33 @@ untouched Chromium and have not been run to completion.
     structural: the loop yields after every single token, `ABSOLUTE_CEILING`
     bounds one response, and the aging pass counts rounds rather than
     milliseconds. None of those take a calibration input.
+
+28. **There is no user-initiated stop, and the API cannot express one.**
+    `malabr.idl` exposes exactly one function, `generate()`. A turn ends by
+    reaching EOS, hitting the output cap, being superseded by the next prompt,
+    or the tab closing/navigating. A user who simply wants to stop a running
+    response — the Stop button every comparable chat UI has — has no way to say
+    so except by sending another prompt, which replaces rather than cancels and
+    puts a new turn into context.
+
+    Noticed while using the panel, not by reading the spec. The server side is
+    already capable: §6b's rule that "a turn only enters permanent context if it
+    reaches EOS or the output cap" describes precisely what a stop must do, and
+    `_roll_back_partial()` implements it — cancellation is reachable today only
+    through tab-close and supersede. What is missing is a way to ask for it.
+
+    Not a UI patch: it needs a new IDL function (`cancel(requestId)`), a
+    corresponding ExtensionFunction class, a histogram enum value, and a route
+    to carry it — either a fifth control message or a per-request signal.
+    Worth deciding deliberately, since a Stop that leaves a half-finished
+    assistant turn in the KV cache would reintroduce exactly the desync §6b
+    exists to prevent.
+
+29. **The panel must not disable input during generation — supersede is the
+    designed behaviour.** An earlier version of the test extension greyed the
+    Send button out while a response streamed, but left the Enter key wired to
+    the same handler, so Enter did what the disabled button said was
+    impossible. The second request then succeeded, because §6b's single-flight
+    replace handled it correctly. The server was right and the UI was lying.
+    The button now becomes "Replace" during generation, and a superseded turn
+    is reported as an ordinary outcome rather than an error.

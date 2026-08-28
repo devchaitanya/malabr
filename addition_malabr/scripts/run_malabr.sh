@@ -45,6 +45,16 @@ declare -A TUNABLES=(
 
 FEATURE_NAME="MalabrTunables"
 
+# The interpreter MalabrManager should spawn app.py with.
+#
+# Not optional in practice: "python3" resolves to whatever is first on PATH,
+# and in a Chromium build shell that is the build environment's python, which
+# has no llama_cpp. app.py then exits immediately with ModuleNotFoundError, no
+# socket is ever created, and every generate() fails with nothing in the UI
+# saying why. Read by malabr_manager.cc as MALABR_PYTHON.
+MALABR_PYTHON="${MALABR_PYTHON:-/home/chaitu/Desktop/vscode/malabr/bin/python}"
+export MALABR_PYTHON
+
 # Separate profile so experiments never disturb a real browsing profile, and
 # so a run can be reset by deleting one directory.
 USER_DATA_DIR="${USER_DATA_DIR:-/tmp/malabr-profile}"
@@ -96,6 +106,10 @@ CHROME_ARGS=(
 if [[ -n "$EXTENSION_DIR" ]]; then
   CHROME_ARGS+=("--load-extension=${EXTENSION_DIR}")
 fi
+if [[ "${NO_SANDBOX:-0}" == "1" ]]; then
+  echo "  WARNING: --no-sandbox is set; renderer processes are UNSANDBOXED." >&2
+  CHROME_ARGS+=("--no-sandbox")
+fi
 
 CHROME_ARGS+=("${EXTRA_ARGS[@]+"${EXTRA_ARGS[@]}"}")
 
@@ -116,6 +130,38 @@ if [[ "$DRY_RUN" == "1" ]]; then
   echo "[dry run] would exec:"
   printf '  %q ' "$CHROME_BIN" "${CHROME_ARGS[@]}"; echo
   exit 0
+fi
+
+# ---------------------------------------------------------------------------
+# SUID SANDBOX
+#
+# A developer build does not produce out/Default/chrome-sandbox unless the
+# chrome_sandbox target is built AND the binary is made setuid root. Without
+# it Chromium aborts at startup with
+#   FATAL:setuid_sandbox_host.cc  The SUID sandbox helper binary is missing
+# which looks alarming but has nothing to do with MALABR -- nothing of ours has
+# run at that point.
+#
+# NO_SANDBOX=1 passes --no-sandbox. That genuinely weakens the browser: renderer
+# processes lose their sandbox, so a hostile page has more reach. Acceptable for
+# a local experiment on a build you made yourself; not something to leave on for
+# ordinary browsing. The proper fix is the two sudo commands printed below.
+if [[ ! -e "${CHROME_BIN%/*}/chrome-sandbox" && "${NO_SANDBOX:-0}" != "1" ]]; then
+  echo "ERROR: ${CHROME_BIN%/*}/chrome-sandbox is missing." >&2
+  echo "" >&2
+  echo "  Quick, for local testing (weakens the renderer sandbox):" >&2
+  echo "      NO_SANDBOX=1 $0" >&2
+  echo "" >&2
+  echo "  Proper, once (needs sudo):" >&2
+  echo "      ./third_party/siso/siso ninja -C out/Default chrome_sandbox" >&2
+  echo "      # NOTE the rename: the target builds chrome_sandbox with an" >&2
+  echo "      # UNDERSCORE, the runtime looks for chrome-sandbox with a HYPHEN." >&2
+  echo "      # cp not mv, so rebuilding the target cannot clobber the setuid copy." >&2
+  echo "      sudo cp out/Default/chrome_sandbox out/Default/chrome-sandbox" >&2
+  echo "      sudo chown root:root out/Default/chrome-sandbox" >&2
+  echo "      sudo chmod 4755 out/Default/chrome-sandbox" >&2
+  echo "      export CHROME_DEVEL_SANDBOX=\$PWD/out/Default/chrome-sandbox" >&2
+  exit 1
 fi
 
 if [[ ! -x "$CHROME_BIN" ]]; then

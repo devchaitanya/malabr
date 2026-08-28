@@ -1,2 +1,4 @@
-models
-malabr.db
+# Machine-specific measurements, regenerated at startup on whatever host runs
+# the server. Section 4's one deliberate durable-storage exception, but there
+# is no reason to carry one machine's numbers into the repository.
+calibration.json
