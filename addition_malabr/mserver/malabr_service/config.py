@@ -128,6 +128,24 @@ def compute_n_threads(physical_cores=None):
     return max(1, round(cores * QUOTA_PCT / 100))
 
 
+def compute_cpu_max_cores(n_threads=None):
+    """HARD CPU ceiling, in cores. A pure backstop, not a normal-operation
+    limit: memory governance caps sessions long before CPU is the bottleneck
+    (RSS is a fixed n_ctx allocation, flat with session count), and a single
+    session cannot monopolise CPU anyway -- input/output caps bound the work
+    per turn, the loop yields after every token, and MALABR_CPU_DUTY throttles
+    the duty cycle. This just stops a bug or a pathological model from taking
+    the whole machine.
+
+    So: half the logical CPUs, but never below n_threads + 1 so it cannot
+    throttle a normal decode. MALABR_CPU_MAX overrides ("N" cores, "N%", or
+    "0"/"off" to disable).
+    """
+    logical = os.cpu_count() or 2
+    nt = n_threads if n_threads is not None else compute_n_threads()
+    return float(max(logical // 2, nt + 1))
+
+
 @dataclass(frozen=True)
 class ServerConfig:
     socket_path: str
@@ -157,6 +175,11 @@ class ServerConfig:
     # proportionally after each round, so average CPU lands near n_threads * d
     # -- smoothly, and with no cgroup / launch-path plumbing. 1.0 = flat out.
     cpu_duty: float = 1.0
+
+    # HARD CPU ceiling in cores (MALABR_CPU_MAX). 0 = disabled. Default computed
+    # by compute_cpu_max_cores() -- half the logical CPUs, never below
+    # n_threads+1, so it is a runaway backstop, not a normal-operation limit.
+    cpu_max_cores: float = 0.0
 
     @property
     def n_ctx_per_session(self):
@@ -216,6 +239,17 @@ def load_config(base_dir=None):
     n_ctx = ((int(env_ctx) // n_seq_max) * n_seq_max if env_ctx
              else compute_n_ctx(n_seq_max, model_bytes=model_bytes))
 
+    n_threads = int(os.getenv("MALABR_N_THREADS", compute_n_threads()))
+    cpu_max_env = (os.getenv("MALABR_CPU_MAX") or "").strip().lower()
+    if cpu_max_env in ("0", "off", "none", "disabled"):
+        cpu_max_cores = 0.0
+    elif not cpu_max_env:
+        cpu_max_cores = compute_cpu_max_cores(n_threads)
+    elif cpu_max_env.endswith("%"):
+        cpu_max_cores = float(cpu_max_env[:-1]) / 100.0
+    else:
+        cpu_max_cores = float(cpu_max_env)
+
     return ServerConfig(
         socket_path=os.getenv("MALABR_SOCKET_PATH", "/tmp/malabr_v3.sck"),
         base_dir=root,
@@ -228,7 +262,7 @@ def load_config(base_dir=None):
                                    os.path.join(root, "calibration.json")),
         n_ctx=n_ctx,
         n_seq_max=n_seq_max,
-        n_threads=int(os.getenv("MALABR_N_THREADS", compute_n_threads())),
+        n_threads=n_threads,
         n_batch=int(os.getenv("MALABR_N_BATCH", "512")),
         quota_pct=int(os.getenv("MALABR_QUOTA_PCT", QUOTA_PCT)),
         # Section 7: a WAITING ROOM, not compute. Must sit well above n_seq_max
@@ -237,4 +271,5 @@ def load_config(base_dir=None):
         shared_kv=os.getenv("MALABR_SHARED_KV") == "1",
         shared_kv_soft_div=int(os.getenv("MALABR_SESSION_SOFT_DIV", "2")),
         cpu_duty=float(os.getenv("MALABR_CPU_DUTY", "1.0")),
+        cpu_max_cores=cpu_max_cores,
     )
