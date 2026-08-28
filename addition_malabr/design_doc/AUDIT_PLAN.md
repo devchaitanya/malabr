@@ -63,6 +63,20 @@ Claude/Anthropic attribution in commits. Server: hand-run from
    leaves KV too -- next turn re-adds it. Verify. Also: after `compact()` keeps
    only the anchor, is the anchor's BOS still there? (anchor = turn_boundaries[0]
    starts at pos 0, never dropped -- should be fine, confirm.)
+   -- UNFOUNDED, correct by construction, confirmed empirically against the
+   actual gemma-3-1b model (BOS = token id 2):
+   * First-turn rollback: `_roll_back_partial` uses `target = pos_before_request`
+     which is 0 for a genuine first turn, so `seq_rm(slot, 0, pos)` evicts BOS.
+     Measured: KV slot goes (0, N) -> (-1, -1), `s.pos` -> 0, `_rendered` -> "".
+     `first_turn = not _rendered` is then True again and `user_turn` re-emits
+     BOS (`inbox_tokens[0] == 2`). Symmetric.
+   * compact(): `turn_boundaries[0]` is never in `droppable` (both `[1:-1]` and
+     `[1:]` start at index 1); `seq_add` shifts only positions `>= turn.end`
+     (> 0). BOS at pos 0 is never removed or moved. Confirmed anchor.start stays
+     0 and `verify_against_full()` holds after compact-to-anchor.
+   The `<bos>` token is invisible on the Qwen test model (add_bos_token=false),
+   so the suite test (53b) locks only the model-independent half: slot emptied,
+   `_rendered` cleared, next turn rebuilds without TemplateError.
 
 4. **`_finish_turn` trailing-whitespace KV trim.** New. `n_trim` from a
    re-tokenisation diff of `reply` vs `reply.rstrip()`. Edge cases: reply is

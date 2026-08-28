@@ -650,6 +650,43 @@ def t52_round_budget_mixed_depth():
            picked == 30 and over == 0, f"fg {picked}/30, over-budget rounds {over}")
 
 
+def t53b_first_turn_rollback_clears_the_bos_slot():
+    """BOS x rollback-to-empty. The first turn tokenises with add_special=True,
+    so for models that set add_bos_token (gemma) <bos> lands at KV pos 0. If that
+    turn is rolled back, _roll_back_partial must seq_rm from pos_before_request
+    (0) -- taking the BOS with it -- and _rendered must return to "" so the next
+    turn's first_turn check re-adds it. The <bos> token itself is only visible on
+    gemma (Qwen sets add_bos_token false), and was verified there offline:
+    BOS = token 2, KV (0,N) -> (-1,-1) after rollback, recall intact. This locks
+    the model-independent half: the slot is emptied, _rendered cleared, pos 0,
+    and the next turn rebuilds and prefills without a TemplateError."""
+    alloc, e = FIX.new_engine()
+    k = key(tab=1)
+    s, _ = e.get_or_create(k, FIX.formatter, eng.OutputCap([(0, 8)]))
+    e.submit(k, "word " * 300)              # long first turn
+    e._apply_control()                      # _begin_turn: first turn, PENDING
+    for _ in range(6):
+        e._step()                          # partial prefill -> real KV at pos 0
+    kv_before = (C.llama_memory_seq_pos_min(FIX.mem, s.slot),
+                 C.llama_memory_seq_pos_max(FIX.mem, s.slot))
+    e._roll_back_partial(s)
+    kv_after = (C.llama_memory_seq_pos_min(FIX.mem, s.slot),
+                C.llama_memory_seq_pos_max(FIX.mem, s.slot))
+    pos_after_rb, rendered_after_rb = s.pos, s.formatter._rendered
+    rolled_clean = (kv_before[0] == 0 and kv_after == (-1, -1)
+                    and pos_after_rb == 0 and rendered_after_rb == "")
+
+    # the next turn rebuilds from empty (first_turn True again) and prefills
+    rerendered = ask(e, k, "Say hi.")
+    reran = (s.turn_boundaries[0].start == 0
+             and s.formatter.verify_against_full()
+             and isinstance(rerendered, str))
+    record("53b", "first-turn rollback empties the KV slot; next turn rebuilds clean",
+           rolled_clean and reran,
+           f"kv {kv_before}->{kv_after} pos_after_rb={pos_after_rb} "
+           f"rendered_after_rb={rendered_after_rb!r} anchor_start={s.turn_boundaries[0].start}")
+
+
 def t53_rollback_survives_compaction():
     alloc, e = FIX.new_engine()
     k = key(tab=1)
