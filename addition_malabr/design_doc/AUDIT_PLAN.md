@@ -42,6 +42,20 @@ Claude/Anthropic attribution in commits. Server: hand-run from
    session than the one whose turn is running. Confirm cross-session: guard
    compacts session A while session B is mid-prefill -- B's positions are
    untouched (seq_rm/seq_add are seq-scoped), but re-check.
+   -- CROSS-SESSION CONCERN UNFOUNDED. compact() is fully seq/session-scoped:
+   seq_rm/seq_add pass s.slot, and every position/boundary/formatter mutation
+   is on the victim's own Session. Compacting A while B is mid-prefill leaves
+   B's pos / prefill_offset / turn_boundaries / inbox_tokens / formatter byte
+   -identical, and B's canary survives. Verified by driving two shared-KV
+   sessions.
+   -- BUT a DISTINCT bug surfaced: _relieve_aggregate_pressure compacts IDLE
+   sessions too, and a normally-finished IDLE session has pos_before_generation
+   pointing INSIDE its last exchange (set at that turn's prefill completion).
+   compact(keep_recent=False) drops exactly that exchange -> corruption assert
+   -> round abandoned and retried forever -> pool wedges. Same class as item 1,
+   different session state. Fix: pin pos_before_generation = pos_before_request
+   in _finish_turn and _roll_back_partial, so once no turn is in flight the
+   marker never lingers inside a compactable exchange. Regression: test 40d.
 
 3. **BOS x rollback-to-empty x compaction.** First turn tokenises with
    `add_special=True` (adds `<bos>` for gemma). If the first turn is rolled

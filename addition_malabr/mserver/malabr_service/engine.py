@@ -1286,6 +1286,10 @@ class Engine:
         if s.pos > target:
             C.llama_memory_seq_rm(self._alloc._mem, s.slot, target, s.pos)
             s.pos = target
+        # No turn is in flight now -- keep pos_before_generation pinned to the
+        # request boundary so it never lingers inside a compactable exchange
+        # (see _finish_turn for the same reasoning).
+        s.pos_before_generation = s.pos_before_request
         # The formatter must roll back with the KV, not after it.
         if s.formatter_cp_before_request is not None:
             s.formatter.restore(s.formatter_cp_before_request)
@@ -1422,6 +1426,14 @@ class Engine:
         s.terminate(frame_type, reason)
         s.state = SessionState.IDLE
         s.produced = 0
+        # The turn is committed; pos_before_generation is no longer an in-flight
+        # marker. Left holding this turn's generation-start position it points
+        # INSIDE the exchange just recorded in turn_boundaries -- and the
+        # shared-KV aggregate guard compacts IDLE sessions too, so its
+        # compact(keep_recent=False) last resort would drop that exchange and
+        # trip compact()'s corruption assert. Pin it back to the request
+        # boundary; _begin_turn / prefill completion set it afresh next turn.
+        s.pos_before_generation = s.pos_before_request
 
     # -- section 8: compaction ----------------------------------------------
 

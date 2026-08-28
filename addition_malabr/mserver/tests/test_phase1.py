@@ -553,6 +553,36 @@ def t40c_agg_guard_last_resort_on_pending_turn():
            f"pbr={s.pos_before_request} pos={s.pos} end={s.turn_boundaries[-1].end}")
 
 
+def t40d_agg_guard_last_resort_on_idle_session():
+    """Shared-KV x 8: the aggregate guard compacts IDLE sessions too. A session
+    that finished a turn normally has pos_before_generation pointing INSIDE its
+    last exchange -- and compact(keep_recent=False) drops exactly that exchange.
+    The stale marker must not trip compact()'s corruption assert."""
+    alloc, e = FIX.new_engine(shared_kv=True)
+    k = key(tab=1)
+    s, _ = e.get_or_create(k, FIX.formatter, eng.OutputCap([(0, 8)]))
+    ask(e, k, "Say hello.")
+    ask(e, k, "Say there.")            # two boundaries; session is now IDLE
+    pinned = s.pos_before_generation == s.pos_before_request
+    idle = s.state == eng.SessionState.IDLE
+
+    e._n_ctx, e._agg_margin, e._fair_share = s.pos - 4, 0, 8
+    raised = None
+    try:
+        e._relieve_aggregate_pressure([s])
+    except RuntimeError as ex:
+        raised = str(ex)
+
+    consistent = (raised is None
+                  and s.pos_before_generation == s.pos_before_request
+                  and s.turn_boundaries[-1].end == s.pos)
+    record("40d", "aggregate guard's last-resort compaction survives an IDLE session",
+           pinned and idle and consistent,
+           f"pinned={pinned} idle={idle} raised={raised} "
+           f"pbg={s.pos_before_generation} pbr={s.pos_before_request} "
+           f"pos={s.pos} end={s.turn_boundaries[-1].end}")
+
+
 def t41_phase_c_is_real():
     import inspect
     src = inspect.getsource(cal.phase_c_joint_worst_case)
