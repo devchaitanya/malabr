@@ -24,6 +24,7 @@ namespace extensions {
 namespace {
 
 constexpr char kMalabrGenerateRoute[] = "ROUTE_MALABR_GENERATE_API";
+constexpr char kMalabrStopRoute[] = "ROUTE_MALABR_STOP";
 
 constexpr char kOnTokenEvent[] = "malabr.onToken";
 constexpr char kOnCompleteEvent[] = "malabr.onComplete";
@@ -223,6 +224,66 @@ void MalabrGenerateFunction::OnComplete(std::string error) {
 
   // Balances the AddRef() in Run(). Exactly one terminal frame per request,
   // so this runs exactly once.
+  Release();
+}
+
+
+// ---------------------------------------------------------------------------
+// malabr.stop()
+// ---------------------------------------------------------------------------
+
+MalabrStopFunction::MalabrStopFunction() = default;
+MalabrStopFunction::~MalabrStopFunction() = default;
+
+ExtensionFunction::ResponseAction MalabrStopFunction::Run() {
+  // Same identity derivation as generate(), for the same reason: the session
+  // key must be browser-derived end to end, or a page could stop someone
+  // else's conversation.
+  content::WebContents* web_contents = GetSenderWebContents();
+  if (!web_contents) {
+    return RespondNow(Error("no sender WebContents"));
+  }
+  content::RenderFrameHost* rfh = render_frame_host();
+  if (!rfh) {
+    return RespondNow(Error("no sender frame"));
+  }
+  const url::Origin& frame_origin = rfh->GetLastCommittedOrigin();
+  if (frame_origin.opaque()) {
+    return RespondNow(Error("malabr is unavailable on opaque origins"));
+  }
+
+  const int tab_id = sessions::SessionTabHelper::IdForTab(web_contents).id();
+
+  AddRef();
+  base::ThreadPool::PostTask(
+      FROM_HERE, {base::MayBlock()},
+      base::BindOnce(&MalabrStopFunction::DispatchStop, base::Unretained(this),
+                     extension_id(), tab_id, frame_origin.Serialize()));
+  return RespondLater();
+}
+
+void MalabrStopFunction::DispatchStop(std::string extension_id,
+                                      int tab_id,
+                                      std::string origin) {
+  auto server = std::make_unique<extensions::MServerUDS>(
+      GetMalabrSocketPath(), kMalabrStopRoute, extension_id);
+
+  std::string error;
+  // foreground=true is a placeholder here: the header field is a SEED for a
+  // NEW session only (section 6's ordering rule) and a stop never creates one,
+  // so the value cannot affect scheduling.
+  const bool ok = server->SendControlRequest(tab_id, origin, true, error);
+
+  content::GetUIThreadTaskRunner({})->PostTask(
+      FROM_HERE, base::BindOnce(&MalabrStopFunction::OnStopped,
+                                base::Unretained(this), ok, std::move(error)));
+}
+
+void MalabrStopFunction::OnStopped(bool ok, std::string error) {
+  // A stop that found nothing to stop is NOT an error: the response may have
+  // finished between the click and this call, which is an ordinary race, not
+  // a failure the page should have to handle.
+  Respond(ok ? NoArguments() : Error(error));
   Release();
 }
 

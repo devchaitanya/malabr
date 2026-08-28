@@ -18,7 +18,7 @@ from .config import load_config
 from .protocol import (
     FRAME_COMPLETE, FRAME_ERROR, FRAME_TOKEN,
     MSG_EXT_UNLOADED, MSG_FOREGROUND, MSG_LIVE_TABS, MSG_TAB_CLOSED,
-    ProtocolError, ROUTE_CONTROL, ROUTE_GENERATE,
+    ProtocolError, ROUTE_CONTROL, ROUTE_GENERATE, ROUTE_STOP,
     encode_frame, read_control_message, recv_full, unpack_client_envelope,
 )
 
@@ -204,6 +204,10 @@ class ControlReader:
         self._thread.start()
 
 
+def eng_stop(engine, env):
+    return engine.stop_generation(env.session_key, "stopped")
+
+
 class MalabrServer:
     """UDS listener + request routing."""
 
@@ -285,6 +289,17 @@ class MalabrServer:
             conn.close()
             return
         env = unpack_client_envelope(header)         # validates and bounds
+
+        if env.route == ROUTE_STOP:
+            # Identity comes from the header, exactly as it does for generate,
+            # so a page cannot stop a session that is not its own.
+            stopped = eng_stop(self._engine, env)
+            self._send(conn, FRAME_COMPLETE, "stopped" if stopped else "nothing to stop")
+            try:
+                conn.close()
+            except OSError:
+                pass
+            return
 
         if env.route == ROUTE_CONTROL:
             # Hand the socket to the dedicated reader thread and do NOT close

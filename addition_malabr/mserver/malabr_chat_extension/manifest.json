@@ -3,12 +3,21 @@
   "name": "MALABR Chat",
   "version": "1.0",
   "description": "Phase 1 smoke test: streamed malabr.generate() from a content script.",
-  "permissions": ["malabr"],
-  "host_permissions": ["<all_urls>"],
+  "permissions": [
+    "malabr",
+    "storage"
+  ],
+  "host_permissions": [
+    "<all_urls>"
+  ],
   "content_scripts": [
     {
-      "matches": ["<all_urls>"],
-      "js": ["content.js"],
+      "matches": [
+        "<all_urls>"
+      ],
+      "js": [
+        "content.js"
+      ],
       "run_at": "document_idle",
       "all_frames": false
     }

@@ -696,6 +696,9 @@ class Session:
         self.pending_replace = None
         self.cancelled = False
         self.cancel_reason = None
+        # Set by stop_generation(). Unlike `cancelled` this ends the TURN, not
+        # the session.
+        self.stop_requested = None
 
     # -- outbox ------------------------------------------------------------
 
@@ -903,6 +906,30 @@ class Engine:
         s.cancel_reason = reason
         return True
 
+    def stop_generation(self, key, reason="stopped"):
+        """User-initiated stop: end the turn, KEEP the session.
+
+        Distinct from cancel(), which tears the session down for tab close or
+        eviction. A stop must leave the conversation intact and reusable -- the
+        user wants this answer to end, not the chat to disappear.
+
+        Rolls the partial turn back for the reason section 6b already gives:
+        a turn enters permanent context ONLY by reaching EOS or the output cap.
+        A stop that left a half-finished assistant turn in the cache would
+        desync the model from what the user can see, which is exactly what that
+        rule exists to prevent.
+
+        Flag only -- the rollback itself is engine-thread work.
+        """
+        with self._reg_lock:
+            s = self._sessions.get(key)
+        if s is None or s.state == SessionState.DEAD:
+            return False                    # defined no-op
+        if s.state not in (SessionState.PENDING, SessionState.GENERATING):
+            return False                    # nothing in flight
+        s.stop_requested = reason
+        return True
+
     def submit(self, key, text):
         """Queue a new prompt and return THIS request's outbox.
 
@@ -1090,6 +1117,13 @@ class Engine:
                 self._roll_back_partial(s)
                 s.terminate(FRAME_ERROR, s.cancel_reason or "cancelled")
                 self._teardown(s, s.cancel_reason)
+                continue
+            if s.stop_requested is not None:
+                reason, s.stop_requested = s.stop_requested, None
+                # Same rollback as a supersede, then the session goes idle and
+                # stays available -- no teardown, no slot release.
+                self._roll_back_partial(s)
+                s.terminate(FRAME_ERROR, reason)
                 continue
             if s.pending_replace is not None:
                 text = s.pending_replace

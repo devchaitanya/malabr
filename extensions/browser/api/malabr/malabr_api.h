@@ -23,6 +23,29 @@ namespace extensions {
 // tab_id and visibility are all DERIVED here, never accepted from the caller.
 // A content script cannot claim to be a different tab, or claim to be
 // foreground to steal scheduler priority (sections 5, 5a).
+// End the response currently streaming for this tab, keeping the session.
+//
+// Deliberately takes no arguments. The session is addressed by the same
+// browser-derived (extension, tab, origin) identity the header already
+// carries, so a page cannot stop a session that is not its own -- a
+// page-supplied request id would be exactly the sort of claim section 5
+// refuses to trust.
+class MalabrStopFunction : public ExtensionFunction {
+ public:
+  DECLARE_EXTENSION_FUNCTION("malabr.stop", MALABR_STOP)
+  MalabrStopFunction();
+
+ protected:
+  ~MalabrStopFunction() override;
+
+ private:
+  ResponseAction Run() override;
+
+  // Runs on a MayBlock() thread pool thread.
+  void DispatchStop(std::string extension_id, int tab_id, std::string origin);
+  void OnStopped(bool ok, std::string error);
+};
+
 class MalabrGenerateFunction : public ExtensionFunction {
  public:
   DECLARE_EXTENSION_FUNCTION("malabr.generate", MALABR_GENERATE)

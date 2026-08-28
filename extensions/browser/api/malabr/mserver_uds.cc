@@ -247,6 +247,42 @@ bool MServerUDS::ReadExact(MSocketUDS& socket,
   return true;
 }
 
+bool MServerUDS::SendControlRequest(int tab_id,
+                                    const std::string& origin,
+                                    bool foreground,
+                                    std::string& error_msg) {
+  base::FilePath path(socket_path_);
+  MSocketUDS socket(path.value());
+
+  // No retry budget here, unlike Send(). A stop is only meaningful while a
+  // response is already streaming, which means the server is up and a socket
+  // was opened seconds ago. Retrying for three minutes would leave the UI
+  // waiting long after the thing it wanted to stop had finished on its own.
+  int result = socket.Connect();
+  if (result != net::OK) {
+    error_msg = "connect failed: " + std::to_string(result);
+    return false;
+  }
+  socket.SetReadTimeout(
+      extensions_features::kMalabrFrameReadTimeoutSeconds.Get());
+
+  const std::string header = GetHeaderPayload(tab_id, origin, foreground, 0);
+  if (!WriteExact(socket, header.data(), header.size(), error_msg)) {
+    return false;
+  }
+
+  uint8_t type = 0;
+  std::string payload;
+  if (!ReadFrame(socket, type, payload, error_msg)) {
+    return false;
+  }
+  if (type == kFrameError) {
+    error_msg = payload;
+    return false;
+  }
+  return true;
+}
+
 std::string MServerUDS::GetHeaderPayload(int tab_id,
                                          const std::string& origin,
                                          bool foreground,

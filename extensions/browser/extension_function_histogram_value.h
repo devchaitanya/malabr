@@ -1973,6 +1973,7 @@ enum HistogramValue {
   DELETED_MALABR_PREDICT = 1905,
   DELETED_MALABR_CHECKSTATUS = 1906,
   MALABR_GENERATE = 1907,
+  MALABR_STOP = 1908,
       // Last entry: Add new entries above, then run:
       // tools/metrics/histograms/update_extension_histograms.py
       ENUM_BOUNDARY

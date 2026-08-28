@@ -7,6 +7,7 @@
 #include <utility>
 
 #include "base/command_line.h"
+#include "base/environment.h"
 #include "base/logging.h"
 #include "base/path_service.h"
 #include "base/process/launch.h"
@@ -245,7 +246,29 @@ void MalabrManager::StartMLServerIfEnabled() {
 
   LOG(INFO) << "Server script path: " << server_script.value();
 
-  base::CommandLine mserver_cmd(base::FilePath("python3"));
+  // The interpreter is configurable, for the same reason the socket path is:
+  // "python3" resolves to whatever is first on PATH, and in a Chromium build
+  // shell that is the build environment's python -- which has no llama_cpp.
+  // app.py then dies instantly with ModuleNotFoundError, no socket is ever
+  // created, and every generate() fails with nothing in the UI to explain it.
+  // MALABR_PYTHON names the interpreter that actually has the runtime.
+  std::string python_bin = "python3";
+  {
+    std::unique_ptr<base::Environment> env(base::Environment::Create());
+    std::string from_env;
+    if (env->GetVar("MALABR_PYTHON", &from_env) && !from_env.empty()) {
+      python_bin = from_env;
+    }
+  }
+  LOG(INFO) << "MalabrManager: interpreter " << python_bin;
+
+  // Named variable, not a temporary: `CommandLine cmd(FilePath(python_bin))`
+  // is the most vexing parse -- with an identifier inside, the compiler reads
+  // it as a function declaration. The original took a string literal, which
+  // cannot be a parameter name, so this only appeared once the value moved
+  // into a variable.
+  const base::FilePath python_path(python_bin);
+  base::CommandLine mserver_cmd(python_path);
   mserver_cmd.AppendArg("-u");
   mserver_cmd.AppendArg(server_script.value());
 

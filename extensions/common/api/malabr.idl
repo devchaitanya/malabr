@@ -27,8 +27,22 @@ namespace malabr {
   // time-to-first-token is the metric Phase 2 needs (phase1_design.md 6).
   callback GenerateCallback = void(DOMString requestId);
 
+  // Resolves once the stop has been applied.
+  callback StopCallback = void();
+
   interface Functions {
     static void generate(GenerateRequest request, optional GenerateCallback callback);
+
+    // End the response currently streaming for THIS tab, keeping the
+    // conversation. Distinct from the teardown a tab close performs: the user
+    // wants this answer to stop, not the chat to disappear.
+    //
+    // Takes no arguments deliberately. The session is identified by the same
+    // browser-derived (extension, tab, origin) key the header already carries,
+    // so a page cannot stop a session that is not its own -- and a requestId
+    // argument would be page-supplied, which is exactly the kind of claim
+    // section 5 refuses to trust.
+    static void stop(optional StopCallback callback);
   };
 
   interface Events {

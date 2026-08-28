@@ -13,6 +13,12 @@ import struct
 
 ROUTE_GENERATE = "ROUTE_MALABR_GENERATE_API"
 ROUTE_CONTROL = "ROUTE_MALABR_CONTROL"
+# A user-initiated stop. Its own route rather than a fifth control message,
+# because extensions/browser cannot include chrome/browser/malabr_manager.h
+# (Chromium layering) and so cannot reach the control connection at all. The
+# request header already carries the full session identity, so a stop needs
+# nothing the generate path does not already send.
+ROUTE_STOP = "ROUTE_MALABR_STOP"
 
 # Response frame types (section 6). Must match mserver_uds.cc's kFrame* values.
 FRAME_TOKEN = 0
@@ -139,7 +145,7 @@ def unpack_client_envelope(header_bytes):
         raise ProtocolError(f"expected 6 header fields, got {len(parts)}")
     route, extension_id, tab_id_text, origin, visibility, size_text = parts
 
-    if route not in (ROUTE_GENERATE, ROUTE_CONTROL):
+    if route not in (ROUTE_GENERATE, ROUTE_CONTROL, ROUTE_STOP):
         raise ProtocolError(f"unknown route {route!r}")
 
     if len(extension_id) != EXTENSION_ID_LEN or not _EXT_ID_CHARS.issuperset(extension_id):
@@ -179,8 +185,8 @@ def unpack_client_envelope(header_bytes):
     if payload_size > MAX_PAYLOAD_SIZE:
         raise ProtocolError(
             f"payload size {payload_size} exceeds {MAX_PAYLOAD_SIZE}")
-    if route == ROUTE_CONTROL and payload_size != 0:
-        raise ProtocolError("control connection must declare payload_size=0")
+    if route in (ROUTE_CONTROL, ROUTE_STOP) and payload_size != 0:
+        raise ProtocolError(f"{route} must declare payload_size=0")
 
     return ClientEnvelope(route, extension_id, tab_id, origin, visibility,
                           payload_size)

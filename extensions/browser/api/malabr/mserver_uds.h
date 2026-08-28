@@ -43,6 +43,16 @@ class MServerUDS {
                      const AbandonPredicate& is_abandoned,
                      std::string& error_msg);
 
+  // A header-only request: no payload, exactly one terminal frame back.
+  //
+  // Used by malabr.stop(). It carries the same browser-derived identity as
+  // generate() because that identity IS the addressing -- the server needs no
+  // request id to know which session to end.
+  bool SendControlRequest(int tab_id,
+                          const std::string& origin,
+                          bool foreground,
+                          std::string& error_msg);
+
  private:
   // "route,extension_id,tab_id,origin,visibility,payload_size",
   // length-prefixed. tab_id, origin and visibility are all attached HERE, by
