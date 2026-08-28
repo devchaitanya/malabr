@@ -153,6 +153,11 @@ class ServerConfig:
     shared_kv: bool = False
     shared_kv_soft_div: int = 2
 
+    # Cooperative CPU throttle (MALABR_CPU_DUTY, 0<d<=1). The engine sleeps
+    # proportionally after each round, so average CPU lands near n_threads * d
+    # -- smoothly, and with no cgroup / launch-path plumbing. 1.0 = flat out.
+    cpu_duty: float = 1.0
+
     @property
     def n_ctx_per_session(self):
         """The per-session budget section 8's compaction trigger measures against.
@@ -231,4 +236,5 @@ def load_config(base_dir=None):
         client_pool_workers=int(os.getenv("MALABR_CLIENT_WORKERS", "64")),
         shared_kv=os.getenv("MALABR_SHARED_KV") == "1",
         shared_kv_soft_div=int(os.getenv("MALABR_SESSION_SOFT_DIV", "2")),
+        cpu_duty=float(os.getenv("MALABR_CPU_DUTY", "1.0")),
     )

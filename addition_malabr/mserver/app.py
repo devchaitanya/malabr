@@ -72,13 +72,16 @@ def build(cfg, quick_calibration=False):
                         sampling=eng.SAMPLING_CHAT,
                         n_ctx=cfg.n_ctx, n_seq_max=cfg.n_seq_max,
                         shared_kv=cfg.shared_kv,
-                        session_budget=cfg.n_ctx_per_session)
+                        session_budget=cfg.n_ctx_per_session,
+                        cpu_duty=cfg.cpu_duty)
     output_cap = cal.apply_to_engine(result, engine, eng)
 
     print(f"malabr: model={os.path.basename(cfg.model_path)} "
           f"n_ctx={cfg.n_ctx} ({cfg.n_ctx_per_session}/session"
           f"{', shared-KV' if cfg.shared_kv else ''}) "
-          f"n_seq_max={cfg.n_seq_max} n_threads={n_threads}", flush=True)
+          f"n_seq_max={cfg.n_seq_max} n_threads={n_threads}"
+          f"{f' cpu_duty={cfg.cpu_duty}' if cfg.cpu_duty < 1.0 else ''}",
+          flush=True)
     print(f"malabr: calibration {'measured' if measured else 'loaded'}"
           f"{' (FALLBACK)' if result.get('fallback') else ''}"
           f" passed={result.get('passed')}", flush=True)

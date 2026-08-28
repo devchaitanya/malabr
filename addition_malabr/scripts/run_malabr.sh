@@ -63,6 +63,13 @@ export MALABR_PYTHON
 MALABR_SHARED_KV="${MALABR_SHARED_KV:-1}"
 export MALABR_SHARED_KV
 
+# Cooperative CPU throttle (phase1_design.md 11). 0<d<=1: the engine sleeps
+# proportionally after each round so average CPU lands near n_threads*d,
+# smoothly, with no cgroup. 1.0 (default) = flat out. Try 0.5 if inference
+# makes the machine feel unresponsive; it roughly halves token rate.
+MALABR_CPU_DUTY="${MALABR_CPU_DUTY:-1.0}"
+export MALABR_CPU_DUTY
+
 # Separate profile so experiments never disturb a real browsing profile, and
 # so a run can be reset by deleting one directory.
 USER_DATA_DIR="${USER_DATA_DIR:-/tmp/malabr-profile}"

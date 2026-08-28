@@ -774,7 +774,8 @@ class Engine:
     """
 
     def __init__(self, ctx, model, vocab, allocator, sampling=None, seed=0,
-                 n_ctx=None, n_seq_max=None, shared_kv=False, session_budget=2048):
+                 n_ctx=None, n_seq_max=None, shared_kv=False, session_budget=2048,
+                 cpu_duty=1.0):
         self._ctx = ctx
         self._model = model
         self._vocab = vocab
@@ -793,6 +794,10 @@ class Engine:
         self._session_budget = session_budget
         self._fair_share = max(1, self._n_ctx // self._n_seq_max)
         self._agg_margin = 64               # leave a little slack under n_ctx
+
+        # Cooperative CPU throttle (§11): fraction of wall time the engine may
+        # spend computing. 1.0 = flat out. See _run.
+        self._cpu_duty = min(1.0, max(0.05, cpu_duty))
 
         self._sessions = {}                 # key -> Session
         self._reg_lock = threading.Lock()   # guards _sessions only
@@ -991,6 +996,7 @@ class Engine:
 
     def _run(self):
         while self._running:
+            t_start = time.perf_counter()
             try:
                 did_work = self._step()
             except Exception as exc:
@@ -1015,6 +1021,15 @@ class Engine:
             self.round_errors = 0
             if not did_work:
                 time.sleep(0.001)
+            elif self._cpu_duty < 1.0:
+                # Cooperative CPU throttle. llama_decode pegs n_threads cores for
+                # the round's compute; sleeping proportionally afterwards holds
+                # the average near n_threads * cpu_duty, smoothly -- no cgroup,
+                # no launch-path plumbing, and per-token latency scales by
+                # 1/cpu_duty predictably instead of the period-freeze a
+                # kernel quota causes.
+                busy = time.perf_counter() - t_start
+                time.sleep(busy * (1.0 / self._cpu_duty - 1.0))
 
     def _step(self):
         """One iteration. Returns True if any work was done.

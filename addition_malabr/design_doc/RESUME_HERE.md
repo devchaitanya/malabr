@@ -45,10 +45,15 @@ own both work; only one can hold `/tmp/malabr_v3.sck` at a time.
   - RSS flat under load at 1× and 3× n_ctx (+1..+19 MiB over 4 sessions)
 - **Foreground priority**: 1 fg + 3 bg all generating long → fg ~25-38 tok/s,
   bg ~0 during contention (200-500×). It is near-absolute (§9a), not a bias.
-- **CPU**: `n_threads` alone pins ~3.0 cores (soft). A cgroup `CPUQuota=150%`
-  via `systemd-run --user --scope` clamps to ~1.7 cores even with n_threads=3
-  (hard). `MALABR_N_THREADS` now actually takes effect (it was silently
-  overridden by cached calibration).
+- **CPU**: three levers now.
+  - `n_threads` alone pins ~3.0 cores (soft). `MALABR_N_THREADS` now actually
+    takes effect (it was silently overridden by cached calibration).
+  - `MALABR_CPU_DUTY=0.5` -- cooperative throttle: the engine sleeps
+    proportionally after each round. Measured 3.0 -> 2.5 cores, token rate
+    ~halved, tail latency smoother than the cgroup (p95 127ms vs 189ms). No
+    cgroup, no launch-path plumbing -- this is the practical CPU cap.
+  - cgroup `CPUQuota=150%` via `systemd-run --user --scope` clamps to ~1.6
+    cores even with n_threads=3 (hard), but see "NOT done" below.
 - **Shared-KV scheduler timing** (fg vs 3 DEEP bg sessions): fg inter-token
   latency p50=36ms, p95=60ms, max=74ms against a ~50ms round budget — the bound
   mostly holds, ~1.5× tail overshoot under deep contention. Worth a proper
@@ -79,7 +84,9 @@ automated test:
    propagate to the python child (tested: `KillMode=control-group` only applies
    on `systemctl stop`, not a signal). Wiring it properly needs MalabrManager to
    stop a transient *service* instead of killing a pid — a C++ change + a
-   browser-teardown test. `MALABR_N_THREADS` is the working soft cap meanwhile.
+   browser-teardown test. `MALABR_CPU_DUTY` (cooperative throttle) and
+   `MALABR_N_THREADS` are the working caps meanwhile, both pure-Python and in
+   `run_malabr.sh`.
 2. **Output FIDELITY** — §8's logit-divergence check has still never been run.
 3. **Real scheduler TIMING** — the p95/max overshoot above needs a proper rig;
    test 23 (p99 under a real cpu.max quota) still needs cgroup work.
@@ -93,6 +100,7 @@ automated test:
 
     MALABR_SHARED_KV=1            one shared KV pool + aggregate cap (default via run_malabr.sh)
     MALABR_SESSION_SOFT_DIV=2     per-session soft cap = n_ctx / this
+    MALABR_CPU_DUTY=0.5           cooperative CPU throttle (engine sleeps between rounds)
     MALABR_N_THREADS=N            now actually overrides calibration's pick
     MALABR_MODEL_PATH / _DIR      already existed; the panel's model switcher uses them
 
