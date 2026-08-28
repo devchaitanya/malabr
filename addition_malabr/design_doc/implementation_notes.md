@@ -450,3 +450,50 @@ untouched Chromium and have not been run to completion.
     for exactly this class of reason; the interpreter now is too, via
     `MALABR_PYTHON`, with `run_malabr.sh` exporting the one that carries the
     runtime. **Recommend §10 name this alongside the socket path.**
+
+32. **Reasoning tokens are suppressed at the PROMPT, not at the stream.**
+    Qwen3 emits a visible chain of thought before its answer. Filtering that in
+    the UI or the streaming layer would still generate every one of those
+    tokens, so they would consume the per-request output cap, the session's
+    context budget and wall-clock time, and then be thrown away. The template
+    itself has the switch:
+
+        {%- if enable_thinking is defined and enable_thinking is false %}
+            {{- '<think>\n\n</think>\n\n' }}
+
+    i.e. it pre-fills an already-closed think block. `llama_chat_apply_template`
+    cannot pass template VARIABLES, only messages, so `ChatFormatter` READS
+    that literal out of the template source rather than hardcoding it. A model
+    whose template has no such branch gets "" and is unaffected — verified:
+    Qwen3 yields `'<think>\n\n</think>\n\n'`, gemma-3 yields `''`.
+
+    The marker is recorded as part of the ASSISTANT message, not appended only
+    to `_rendered`. In KV terms that is what it is — those tokens sit inside the
+    assistant block ahead of the generated text — and storing it there keeps
+    `_apply()`'s output matching the cache on the next turn. A first attempt
+    appended it to `_rendered` alone, so the re-render no longer contained it
+    and the prefix check failed on turn two, breaking 11 of the §12 tests.
+
+33. **A test that passed by accident: §12 test 19's precondition was implicit.**
+    It installed its bounded outbox after exactly ONE engine step, assuming
+    prefill had completed. That held only while the prompt fitted in a single
+    round. Adding six tokens of no-think marker pushed prefill into a second
+    round, so the session was still PENDING and the stalled-reader path was
+    never exercised at all — the test failed for the right reason. It now drives
+    until the session is demonstrably GENERATING and asserts that precondition
+    before proceeding.
+
+## First live browser session
+
+The full path works end to end: content script -> browser process -> UDS ->
+Python engine -> streamed tokens back into the page. Multi-turn context is
+confirmed working live, which validates §6c's incremental template application
+against a real conversation rather than a harness: told "my name is chaitanya"
+and asked "what is my name" two turns later, the model answered correctly, so
+the session's KV cache genuinely persisted across turns.
+
+Three faults had to be cleared to get there, and two of them produced the SAME
+symptom — an empty chat panel — which is why they had to be found in order:
+`MalabrFeature` disabled by default (nothing was attempted at all), the spawned
+interpreter lacking llama_cpp (server died instantly), and the test extension
+still calling the removed sklearn API.

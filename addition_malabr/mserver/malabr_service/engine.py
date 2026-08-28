@@ -238,7 +238,7 @@ class ChatFormatter:
     trusting it.
     """
 
-    def __init__(self, model, vocab):
+    def __init__(self, model, vocab, disable_thinking=True):
         self._model = model
         self._vocab = vocab
         tmpl = C.llama_model_chat_template(model, None)
@@ -247,6 +247,42 @@ class ChatFormatter:
         self._tmpl = tmpl
         self._messages = []      # full logical history, for re-rendering
         self._rendered = ""      # EXACTLY the text currently represented in KV
+        self._think_suffix = (self._extract_no_think_suffix(tmpl)
+                              if disable_thinking else "")
+
+    @staticmethod
+    def _extract_no_think_suffix(tmpl):
+        """The text this model's template appends to switch reasoning OFF.
+
+        Reasoning models emit a visible chain of thought before the answer.
+        That is not merely noise in the UI: those tokens are generated, so they
+        consume the per-request output cap, the session's context budget and
+        wall-clock time. Suppressing them downstream (in the streamer or the
+        page) would pay all three costs and then throw the result away.
+        Suppressing them at the prompt means they are never produced.
+
+        Qwen3's template does this with
+            {%- if enable_thinking is defined and enable_thinking is false %}
+                {{- '<think>\n\n</think>\n\n' }}
+        i.e. it pre-fills an already-closed think block so the model treats
+        reasoning as finished. llama_chat_apply_template cannot pass template
+        VARIABLES, only messages, so the suffix is READ OUT of the template
+        source instead of hardcoded -- a model whose template has no such
+        branch simply gets "" and is unaffected.
+        """
+        try:
+            source = tmpl.decode("utf-8") if isinstance(tmpl, bytes) else tmpl
+        except (UnicodeDecodeError, AttributeError):
+            return ""
+        import re
+        m = re.search(
+            r"enable_thinking\s+is\s+false\s*%\}\s*\{\{-?\s*'((?:[^'\\]|\\.)*)'",
+            source)
+        if not m:
+            return ""
+        # The captured text is a Jinja string literal: unescape it the same way
+        # Jinja would, so '\n' becomes a real newline.
+        return m.group(1).encode().decode("unicode_escape")
 
     # -- rendering ------------------------------------------------------------
 
@@ -303,6 +339,9 @@ class ChatFormatter:
                 "template broke the prefix property; incremental prefill is "
                 "unsafe for this model")
 
+        # Append the model's own "reasoning off" marker after the generation
+        # prompt, exactly where its template would have put it.
+        full += self._think_suffix
         delta = full[len(self._rendered):]
         self._rendered = full
         return self._tokenize(delta)
@@ -317,7 +356,14 @@ class ChatFormatter:
         with the terminator, which is exactly what makes that delta start on a
         special token.
         """
-        self._messages.append(("assistant", text))
+        # The no-think marker is recorded as part of what the assistant said,
+        # because in KV terms that is exactly what it is: those tokens sit
+        # inside the assistant block, ahead of the generated text. Storing it
+        # here rather than special-casing every render keeps _apply()'s output
+        # matching the cache on the NEXT turn -- an earlier version appended it
+        # only to _rendered, so the re-render no longer had it and the prefix
+        # check failed on turn two.
+        self._messages.append(("assistant", self._think_suffix + text))
         self._rendered += text
 
     def _expected_render(self):
@@ -339,7 +385,7 @@ class ChatFormatter:
             return ""
         if self._messages[-1][0] == "assistant":
             return self._apply(self._messages[:-1], True) + self._messages[-1][1]
-        return self._apply(self._messages, True)
+        return self._apply(self._messages, True) + self._think_suffix
 
     def drop_messages(self, start, count):
         """Remove messages that section 8 compaction evicted from the KV.

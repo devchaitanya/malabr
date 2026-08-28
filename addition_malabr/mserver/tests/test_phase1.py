@@ -286,8 +286,16 @@ def t19_slow_reader_disconnect():
     k = key(tab=1)
     s, _ = e.get_or_create(k, FIX.formatter, eng.OutputCap([(0, 400)]))
     ob = e.submit(k, "Count to one thousand.")
-    e._step()                                    # _begin_turn installs the real
-                                                 # queue; replace it AFTER that
+    # Drive until the session is actually GENERATING before installing the
+    # bounded queue. An earlier version stepped exactly once and assumed
+    # prefill had finished; that held only while the prompt fit in a single
+    # round, so a slightly longer prompt left the session PENDING and the
+    # stall path was never reached. The precondition is now explicit.
+    for _ in range(60):
+        e._step()
+        if s.state == eng.SessionState.GENERATING:
+            break
+    assert s.state == eng.SessionState.GENERATING, f"never began generating: {s.state}"
     s.outbox = queue.Queue(maxsize=3)            # a reader that never drains
     for _ in range(300):
         if not e._step():
