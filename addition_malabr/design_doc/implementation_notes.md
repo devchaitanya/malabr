@@ -425,3 +425,28 @@ untouched Chromium and have not been run to completion.
     replace handled it correctly. The server was right and the UI was lying.
     The button now becomes "Replace" during generation, and a superseded turn
     is reported as an ordinary outcome rather than an error.
+
+30. **`MalabrFeature` is disabled by default and the launcher never enabled it,
+    so nothing ran at all.** `kMalabrFeature` is `FEATURE_DISABLED_BY_DEFAULT`
+    (chrome/common/chrome_features.cc) and is the first thing
+    `MalabrManager::StartMLServerIfEnabled()` checks. `run_malabr.sh` enabled
+    only `MalabrTunables`, which is a DIFFERENT feature carrying the timeout
+    parameters — so the manager returned immediately on every launch: no server
+    spawned, no socket created, and every `generate()` failing with nothing in
+    the log, because nothing was ever attempted.
+
+    Worth noting how it presented. Two independent faults were stacked here:
+    this one, and the interpreter (correction 31 below). Both produce the same
+    visible symptom — an empty chat panel — and the second was invisible until
+    the first was fixed. The absence of any log line was itself the clue: a
+    failed spawn would have logged, a failed connect would have logged, and
+    silence meant the guard.
+
+31. **The spawned interpreter must be configurable; `python3` is the wrong
+    one.** `MalabrManager` launched `base::FilePath("python3")`, which resolves
+    through PATH. In a Chromium build shell that is the build environment's
+    python, which has no `llama_cpp`, so `app.py` exited immediately with
+    `ModuleNotFoundError`. The socket path was already an environment variable
+    for exactly this class of reason; the interpreter now is too, via
+    `MALABR_PYTHON`, with `run_malabr.sh` exporting the one that carries the
+    runtime. **Recommend §10 name this alongside the socket path.**

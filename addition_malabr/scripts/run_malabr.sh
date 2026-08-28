@@ -82,6 +82,15 @@ else
   ENABLE_FEATURES="${FEATURE_NAME}"
 fi
 
+# MalabrFeature is a SEPARATE feature from MalabrTunables, and it is
+# FEATURE_DISABLED_BY_DEFAULT (chrome/common/chrome_features.cc). It is the
+# switch MalabrManager::StartMLServerIfEnabled() checks on its first line, so
+# without it the manager returns immediately: no server is spawned, no socket
+# appears, and every generate() fails with nothing logged to explain why --
+# because nothing was ever attempted. Enabling MalabrTunables alone is not
+# enough; it only carries the timeout parameters.
+ENABLE_FEATURES="${MALABR_FEATURE_NAME:-MalabrFeature},${ENABLE_FEATURES}"
+
 # ---------------------------------------------------------------------------
 # Assemble argv
 # ---------------------------------------------------------------------------
