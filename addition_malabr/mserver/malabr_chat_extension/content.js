@@ -500,9 +500,93 @@
     act.title = busy ? (canStop ? "Stop" : "Sending replaces the current answer") : "Send";
   }
 
+  // ---- /bench : MALABR vs Chrome's built-in Prompt API ------------------
+  function chromeLM() {
+    return self.LanguageModel
+        || (self.ai && (self.ai.languageModel || self.ai.assistant))
+        || null;
+  }
+  async function runChromeLM(prompt, onTok) {
+    const LM = chromeLM();
+    if (!LM) throw new Error("Chrome Prompt API not present in this build");
+    const avail = LM.availability ? await LM.availability()
+                : LM.capabilities ? (await LM.capabilities()).available : "unknown";
+    if (avail === "unavailable" || avail === "no")
+      throw new Error("Prompt API present but model unavailable (" + avail + ")");
+    const s = await LM.create();
+    const stream = s.promptStreaming ? s.promptStreaming(prompt)
+                : s.prompt ? null : null;
+    if (stream) {
+      let prev = "";
+      for await (const chunk of stream) {
+        // some versions yield cumulative text, some yield deltas
+        const delta = chunk.startsWith(prev) ? chunk.slice(prev.length) : chunk;
+        prev = chunk.length >= prev.length ? chunk : prev + chunk;
+        onTok(delta);
+      }
+    } else {
+      onTok(await s.prompt(prompt));
+    }
+    s.destroy && s.destroy();
+  }
+  function runMalabr(prompt, onTok) {
+    return new Promise((resolve, reject) => {
+      chrome.malabr.generate({ prompt }, (id) => {
+        if (chrome.runtime.lastError) return reject(new Error(chrome.runtime.lastError.message));
+        const h = (rid, text) => { if (rid === id) onTok(text); };
+        const done = (rid, err) => {
+          if (rid !== id) return;
+          chrome.malabr.onToken.removeListener(h);
+          chrome.malabr.onComplete.removeListener(done);
+          err && !/stop|supersed/i.test(err) ? reject(new Error(err)) : resolve();
+        };
+        chrome.malabr.onToken.addListener(h);
+        chrome.malabr.onComplete.addListener(done);
+      });
+    });
+  }
+  async function timeOne(label, fn, prompt) {
+    const t0 = performance.now();
+    let first = null, chars = 0;
+    try {
+      await fn(prompt, (t) => { if (first === null) first = performance.now(); chars += (t || "").length; });
+    } catch (e) {
+      return { label, error: e.message };
+    }
+    const total = performance.now() - t0;
+    const gen = first === null ? total : total - (first - t0);
+    return {
+      label,
+      ttft_ms: first === null ? null : Math.round(first - t0),
+      total_ms: Math.round(total),
+      chars,
+      cps: gen > 0 ? +(chars / (gen / 1000)).toFixed(1) : 0,   // chars/sec (~3-4 chars/token)
+    };
+  }
+  async function bench(prompt) {
+    prompt = prompt || "Write two short paragraphs about how tides work.";
+    const turn = render("malabr", "");
+    const body = turn.querySelector(".body");
+    body.textContent = "benchmarking… (MALABR, then Chrome Prompt API)";
+    const rows = [];
+    rows.push(await timeOne("MALABR (" + (modelSel.value || "?") + ")", runMalabr, prompt));
+    rows.push(await timeOne("Chrome Prompt API (Gemini Nano)", runChromeLM, prompt));
+    const fmt = (r) => r.error
+      ? `${r.label}: ${r.error}`
+      : `${r.label}: ttft ${r.ttft_ms ?? "–"}ms · ${r.cps} chars/s · ${r.total_ms}ms total · ${r.chars} chars`;
+    setBody(body, "**benchmark** — prompt: _" + prompt + "_\n\n"
+                 + rows.map((r) => "- " + fmt(r)).join("\n"));
+  }
+
   function ask() {
     const typed = ta.value.trim();
     if (!typed) return;
+    if (/^\/bench\b/.test(typed)) {
+      ta.value = ""; ta.style.height = "auto";
+      render("you", typed);
+      bench(typed.replace(/^\/bench\b\s*/, "") || null);
+      return;
+    }
     if (inFlight || sending) {
       // A generation is already in flight for this tab. A second one must not
       // start alongside it: if a real stop is available, treat this as "stop
