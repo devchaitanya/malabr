@@ -144,10 +144,51 @@ class ServerConfig:
 
     client_pool_workers: int
 
+    # Shared-KV mode (MALABR_SHARED_KV=1). Off: the KV cache is pre-partitioned
+    # into n_seq_max equal hard slices and a session cannot exceed n_ctx/n_seq_max
+    # (llama.cpp enforces this). On: kv_unified=true, one shared pool of n_ctx
+    # cells, each session gets a LARGER soft cap (n_ctx // shared_kv_soft_div,
+    # default n_ctx/2) and compaction is driven by AGGREGATE pressure -- so 1-2
+    # tabs get a big budget and many tabs degrade to roughly fair share.
+    shared_kv: bool = False
+    shared_kv_soft_div: int = 2
+
     @property
     def n_ctx_per_session(self):
-        """The per-session budget section 8's compaction trigger measures against."""
+        """The per-session budget section 8's compaction trigger measures against.
+
+        Shared-KV: a SOFT cap (n_ctx/2 by default) -- the aggregate cap does the
+        real bounding. Partitioned: the HARD slice llama.cpp enforces.
+        """
+        if self.shared_kv:
+            return max(self.n_ctx // self.n_seq_max,
+                       self.n_ctx // max(1, self.shared_kv_soft_div))
         return self.n_ctx // self.n_seq_max
+
+
+def list_models(model_dir):
+    """Every *.gguf in the model directory, by bare name (no extension).
+
+    The chat panel's model switcher offers exactly this set; a switch names one
+    of these and the server re-execs with MALABR_MODEL_PATH pointed at it.
+    """
+    try:
+        names = sorted(f[:-5] for f in os.listdir(model_dir)
+                       if f.endswith(".gguf"))
+    except OSError:
+        names = []
+    return names
+
+
+def resolve_model(model_dir, name):
+    """Map a bare model name from list_models() back to a full path.
+
+    Returns None if the name is not one of the directory's .gguf files -- the
+    switcher must never be able to make the server exec an arbitrary path.
+    """
+    if name not in list_models(model_dir):
+        return None
+    return os.path.join(model_dir, name + ".gguf")
 
 
 def load_config(base_dir=None):
@@ -188,4 +229,6 @@ def load_config(base_dir=None):
         # Section 7: a WAITING ROOM, not compute. Must sit well above n_seq_max
         # or the pool becomes an invisible FIFO gate in front of the scheduler.
         client_pool_workers=int(os.getenv("MALABR_CLIENT_WORKERS", "64")),
+        shared_kv=os.getenv("MALABR_SHARED_KV") == "1",
+        shared_kv_soft_div=int(os.getenv("MALABR_SESSION_SOFT_DIV", "2")),
     )

@@ -55,6 +55,14 @@ FEATURE_NAME="MalabrTunables"
 MALABR_PYTHON="${MALABR_PYTHON:-/home/chaitu/Desktop/vscode/malabr/bin/python}"
 export MALABR_PYTHON
 
+# Shared-KV memory governance (phase1_design.md 8). 1: one shared pool of n_ctx
+# cells, per-session soft cap of n_ctx/2, aggregate compaction -- so 1-2 tabs get
+# a big context (page summaries fit) and many tabs degrade to fair share. 0: the
+# original n_seq_max equal hard slices. The Python default is 0; this launcher
+# opts in. Set MALABR_SHARED_KV=0 here to A/B against the partitioned model.
+MALABR_SHARED_KV="${MALABR_SHARED_KV:-1}"
+export MALABR_SHARED_KV
+
 # Separate profile so experiments never disturb a real browsing profile, and
 # so a run can be reset by deleting one directory.
 USER_DATA_DIR="${USER_DATA_DIR:-/tmp/malabr-profile}"

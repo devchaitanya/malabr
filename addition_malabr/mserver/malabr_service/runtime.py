@@ -6,15 +6,21 @@ Implements section 10a's three server-side rules:
   3. reconcile on the control handshake, not only on explicit messages
 """
 
+import json
 import os
 import signal
 import socket
 import struct
 import sys
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
 
-from .config import load_config
+from .config import list_models, load_config, resolve_model
+
+# Chat-panel control commands, tunnelled through generate() (see handle_generate).
+# A prompt that begins with this is a command, never a turn.
+META_PREFIX = "\x00MALABR::"
 from .protocol import (
     FRAME_COMPLETE, FRAME_ERROR, FRAME_TOKEN,
     MSG_EXT_UNLOADED, MSG_FOREGROUND, MSG_LIVE_TABS, MSG_TAB_CLOSED,
@@ -132,6 +138,7 @@ class ControlReader:
                 pass
 
         self._engine.set_control_connected(True)
+        print("malabr: control connection established", file=sys.stderr, flush=True)
         try:
             while True:
                 try:
@@ -171,6 +178,8 @@ class ControlReader:
             # A single attribute write. Atomic under the GIL, no lock needed,
             # and read fresh by build_batch on the very next round (§5f).
             eng.foreground_tab_id = msg.tab_id
+            print(f"malabr: control FOREGROUND -> tab {msg.tab_id}",
+                  file=sys.stderr, flush=True)
             return
 
         if msg.kind == MSG_TAB_CLOSED:
@@ -325,6 +334,15 @@ class MalabrServer:
             self._send(conn, FRAME_ERROR, "prompt is not valid UTF-8")
             return
 
+        # Model switcher. The page-facing API is only generate()/stop(), so the
+        # chat panel talks to the switcher THROUGH generate(): a prompt that is
+        # exactly the sentinel is a control command, not a turn. The reply comes
+        # back as ordinary token frames (a JSON blob) so no new C++ route or IDL
+        # function -- and therefore no Chromium rebuild -- is needed.
+        if text.startswith(META_PREFIX):
+            self._handle_meta(conn, text[len(META_PREFIX):])
+            return
+
         eng = self._engine
         # RULE 1: cross-origin eviction. Creating a session for (ext, tab,
         # origin) tears down any session with the same (ext, tab) and a
@@ -332,6 +350,9 @@ class MalabrServer:
         # observer -- the next request from that tab simply carries a different
         # origin and the old session cannot survive it.
         doomed = eng.evict_other_origins(env.extension_id, env.tab_id, env.origin)
+        print(f"malabr: generate ext={env.extension_id[:6]} tab={env.tab_id} "
+              f"origin={env.origin} vis={env.visibility} chars={len(text)} "
+              f"evicted={len(doomed)}", file=sys.stderr, flush=True)
         # Wait for the eviction we just asked for to actually complete. Without
         # this, a cross-origin navigation is rejected for "no free slots" while
         # the slot it needs belongs to the session we just condemned -- and it
@@ -340,6 +361,9 @@ class MalabrServer:
 
         session, created = eng.get_or_create(
             env.session_key, self._formatter_factory, self._output_cap)
+        print(f"malabr:   -> session {'CREATED (no prior context)' if created else 'reused'}"
+              f" turns_so_far={len(getattr(session, 'turn_boundaries', [])) if session else 0}",
+              file=sys.stderr, flush=True)
         if session is None:
             # §7's named limitation: admission is not visibility-aware, so a
             # foreground tab CAN be rejected while background tabs hold slots.
@@ -391,6 +415,77 @@ class MalabrServer:
             return True
         except OSError:
             return False
+
+    # -- model switcher --------------------------------------------------------
+
+    def _reply_json(self, conn, obj):
+        """Answer a meta command the same shape a generate() does: the JSON as
+        one token frame, then a clean terminal frame. The panel accumulates the
+        token text for the request id it used and parses it as JSON."""
+        self._send(conn, FRAME_TOKEN, json.dumps(obj))
+        self._send(conn, FRAME_COMPLETE, "")
+        try:
+            conn.close()
+        except OSError:
+            pass
+
+    def _handle_meta(self, conn, command):
+        command = command.strip().rstrip("\x00").strip()
+        model_dir = self._cfg.model_dir
+        current = os.path.splitext(os.path.basename(self._cfg.model_path))[0]
+
+        if command == "list":
+            self._reply_json(conn, {"current": current,
+                                    "available": list_models(model_dir)})
+            return
+
+        if command.startswith("switch "):
+            name = command[len("switch "):].strip()
+            if name == current:
+                self._reply_json(conn, {"ok": True, "noop": True,
+                                        "current": current})
+                return
+            target = resolve_model(model_dir, name)
+            if target is None:
+                self._reply_json(conn, {"ok": False,
+                                        "error": f"unknown model {name!r}"})
+                return
+            # Acknowledge BEFORE re-execing, so the panel gets a reply on this
+            # connection. The exec then replaces this whole process -- every
+            # session and its KV cache goes with it, which is the accepted cost
+            # of a switch (there is no safe way to carry a KV cache across
+            # models).
+            self._reply_json(conn, {"ok": True, "switching": name})
+            print(f"malabr: model switch requested -> {name}; re-execing",
+                  file=sys.stderr, flush=True)
+            threading.Timer(0.4, self._reexec_with_model, args=(target,)).start()
+            return
+
+        self._reply_json(conn, {"ok": False,
+                                "error": f"unknown meta command {command!r}"})
+
+    def _reexec_with_model(self, model_path):
+        """Replace this process with a fresh server on `model_path`.
+
+        os.execv keeps the SAME pid, so MalabrManager's later Terminate(pid)
+        still lands on the real process -- the reason a plain re-exec is used
+        here rather than exit-and-respawn (nothing respawns it) or a transient
+        systemd scope (that changes the pid)."""
+        # Let the acknowledgement frame clear the socket buffer before anything
+        # is torn down.
+        time.sleep(0.2)
+        try:
+            self.stop()                     # close + unlink the listen socket
+        except Exception:
+            pass
+        try:
+            os.unlink(self._cfg.socket_path + ".pid")
+        except OSError:
+            pass
+        os.environ["MALABR_MODEL_PATH"] = os.path.abspath(model_path)
+        app = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                           "app.py")
+        os.execv(sys.executable, [sys.executable, "-u", app])
 
 
 def run_server(config=None, engine=None, formatter_factory=None,

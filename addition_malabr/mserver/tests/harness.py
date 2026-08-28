@@ -54,10 +54,17 @@ class Fixture:
         self.n_seq_max = n_seq_max
         self.n_ctx = n_ctx
 
-    def new_engine(self, sampling=None):
+    def new_engine(self, sampling=None, shared_kv=False, session_budget=None):
         alloc = eng.SlotAllocator(self.mem, self.n_seq_max)
+        if session_budget is None:
+            # 2048 is what the old hardcoded Session.budget was; keep it as the
+            # non-shared default so the existing suite is unperturbed. Shared-KV
+            # tests pass their own.
+            session_budget = self.n_ctx // 2 if shared_kv else 2048
         e = eng.Engine(self.ctx, self.model, self.vocab, alloc,
-                       sampling=sampling or eng.SAMPLING_DETERMINISTIC)
+                       sampling=sampling or eng.SAMPLING_DETERMINISTIC,
+                       n_ctx=self.n_ctx, n_seq_max=self.n_seq_max,
+                       shared_kv=shared_kv, session_budget=session_budget)
         e.cost_curve = eng.CostCurve(DECODE_CURVE, PREFILL_CURVE)
         return alloc, e
 

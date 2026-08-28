@@ -306,16 +306,23 @@ class ChatFormatter:
                 return buf.raw[:n].decode("utf-8")
             size = n + 1               # documented API: retry with the needed size
 
-    def _tokenize(self, text, parse_special=True):
+    def _tokenize(self, text, parse_special=True, add_special=False):
         import ctypes
         b = text.encode("utf-8")
         if not b:
             return []
         cap = len(b) + 64
         buf = (C.llama_token * cap)()
+        # add_special controls BOS. llama_chat_apply_template renders the
+        # template TEXT but never emits the actual BOS token bytes ({{ bos_token
+        # }} is a HuggingFace-ism its engine drops), so BOS has to come from
+        # here -- and only on the very first delta of a conversation. This still
+        # honours the model's own tokenizer.ggml.add_bos_token flag: it is a
+        # no-op for models like Qwen3 that set it false, and prepends <bos> for
+        # models like gemma-3 that require it. Without it gemma-3 loses track of
+        # who is speaking and answers as if it were the user.
         n = C.llama_tokenize(self._vocab, b, len(b), buf, cap,
-                             False,            # add_special: the template already
-                                               # emits any BOS/system preamble
+                             add_special,
                              parse_special)
         if n < 0:
             raise TemplateError(f"llama_tokenize overflow ({n})")
@@ -325,6 +332,7 @@ class ChatFormatter:
 
     def user_turn(self, text):
         """Record a user message and return ONLY the new tokens to prefill."""
+        first_turn = not self._rendered
         self._messages.append(("user", text))
         full = self._apply(self._messages, True)
 
@@ -344,7 +352,8 @@ class ChatFormatter:
         full += self._think_suffix
         delta = full[len(self._rendered):]
         self._rendered = full
-        return self._tokenize(delta)
+        # Only the first delta of the conversation carries BOS (see _tokenize).
+        return self._tokenize(delta, add_special=first_turn)
 
     def assistant_generated(self, text):
         """Record what the model actually produced.
@@ -637,7 +646,7 @@ class Session:
     conversation (section 5g).
     """
 
-    def __init__(self, key, slot, formatter, output_cap):
+    def __init__(self, key, slot, formatter, output_cap, session_budget=2048):
         self.key = key
         self.slot = slot
         self.formatter = formatter
@@ -679,7 +688,11 @@ class Session:
         # system/tools preamble and StreamingLLM's finding that the first ~32
         # tokens act as attention anchors whose loss degrades output sharply.
         self.turn_boundaries = []
-        self.budget = 2048              # n_ctx / n_seq_max; set by the caller
+        # Partitioned KV: the hard slice n_ctx/n_seq_max. Shared KV: a SOFTER
+        # cap (n_ctx/2 by default) -- the engine's aggregate guard is the real
+        # bound. Passed in from config so it tracks n_ctx / n_seq_max instead of
+        # a constant that silently goes stale when either changes.
+        self.budget = session_budget
 
         # §9a aging: consecutive rounds this session was passed over.
         self.rounds_excluded = 0
@@ -760,13 +773,26 @@ class Engine:
     prepare() (engine thread) from acquire() (any thread).
     """
 
-    def __init__(self, ctx, model, vocab, allocator, sampling=None, seed=0):
+    def __init__(self, ctx, model, vocab, allocator, sampling=None, seed=0,
+                 n_ctx=None, n_seq_max=None, shared_kv=False, session_budget=2048):
         self._ctx = ctx
         self._model = model
         self._vocab = vocab
         self._alloc = allocator
         self._sampling = sampling if sampling is not None else SAMPLING_CHAT
         self._seed = seed
+
+        # Shared-KV aggregate governance (§8). Off by default: behaviour is
+        # exactly the partitioned model. On: one shared pool of n_ctx cells,
+        # sessions get `session_budget` as a soft cap, and _relieve_aggregate
+        # keeps Sigma(pos) < n_ctx by compacting the largest over-fair-share
+        # session first.
+        self._shared_kv = shared_kv
+        self._n_ctx = n_ctx or (session_budget * (n_seq_max or 8))
+        self._n_seq_max = n_seq_max or 8
+        self._session_budget = session_budget
+        self._fair_share = max(1, self._n_ctx // self._n_seq_max)
+        self._agg_margin = 64               # leave a little slack under n_ctx
 
         self._sessions = {}                 # key -> Session
         self._reg_lock = threading.Lock()   # guards _sessions only
@@ -802,7 +828,8 @@ class Engine:
             slot = self._alloc.acquire()
             if slot is None:
                 return None, False          # at capacity -- caller rejects
-            s = Session(key, slot, formatter_factory(), output_cap)
+            s = Session(key, slot, formatter_factory(), output_cap,
+                        session_budget=self._session_budget)
             self._sessions[key] = s
             return s, True
 
@@ -1021,6 +1048,13 @@ class Engine:
                     and not s.cancelled and self.needs_compaction(s):
                 self.compact(s)
 
+        # Shared-KV aggregate guard, same "before composition" reason. With one
+        # shared pool a single session's soft cap can be n_ctx/2, so the sum
+        # across sessions can exceed n_ctx -- and then llama_decode fails with
+        # "no memory slot". Keep Sigma(pos) under n_ctx by compacting.
+        if self._shared_kv:
+            self._relieve_aggregate_pressure(sessions)
+
         decode_picks, prefill_chunks, estimated_ms = build_batch(
             sessions, self.cost_curve, self.effective_foreground_tab_id())
         if not decode_picks and not prefill_chunks:
@@ -1134,7 +1168,30 @@ class Engine:
                 if s.state in (SessionState.PENDING, SessionState.GENERATING):
                     self._roll_back_partial(s)
                     s.terminate(FRAME_ERROR, "superseded")
-                self._begin_turn(s, text)
+                try:
+                    self._begin_turn(s, text)
+                except ValueError as exc:
+                    # Gate 2 (the input cap in _begin_turn) fired. It raises on
+                    # purpose -- a loud "something upstream is broken" signal --
+                    # but the client must still get ONE terminal frame, or the
+                    # browser sits until its 60s read timeout and surfaces only
+                    # "read failed ... result -7". Convert the raise into that
+                    # frame here; the log line above/below keeps the signal. The
+                    # session stays alive -- the input was bad, not the session.
+                    print(f"malabr: {exc}", file=sys.stderr, flush=True)
+                    s.terminate(FRAME_ERROR, str(exc))
+                    s.state = SessionState.IDLE
+                except TemplateError as exc:
+                    # The formatter desynced from the KV (its _rendered is no
+                    # longer a prefix of the freshly rendered conversation).
+                    # Retrying cannot fix this -- every subsequent turn hits the
+                    # same wall -- so end the session cleanly instead of failing
+                    # the round forever.
+                    print(f"malabr: formatter desync, ending session: {exc}",
+                          file=sys.stderr, flush=True)
+                    s.terminate(FRAME_ERROR,
+                                "conversation state was lost -- start a new chat")
+                    self._teardown(s, "formatter desync")
 
     def _begin_turn(self, s, text):
         # Swap in the queue this request's handler is already holding. Done here
@@ -1147,20 +1204,35 @@ class Engine:
         s.formatter_cp_before_request = s.formatter.checkpoint()
         s.inbox_tokens = s.formatter.user_turn(text)
         # Section 8 gate 2: defense in depth at the point of no return. Gate 1
-        # lives upstream at admission; one check point is a single point of
-        # failure, and this one is structurally unskippable by anything above
-        # it, because no turn can start without passing through here. If it ever
-        # fires, something upstream is broken -- that is the signal, not silent
-        # tolerance of the oversized input.
+        # lives upstream at admission; this one is structurally unskippable,
+        # because no turn can start without passing through here. It RAISES
+        # rather than tolerating the oversized input -- a loud "something
+        # upstream is broken" signal. _apply_control catches the raise and
+        # turns it into the client's terminal frame, so the browser still gets
+        # a clean "prompt is too long" instead of a 60s read timeout.
         max_input = s.budget - RESERVED_FOR_RESPONSE
+        if self._shared_kv:
+            # Shared-KV: s.budget is a soft cap. The real limit is the shared
+            # pool minus what the OTHER sessions are entitled to keep -- their
+            # fair share -- NOT their current size: _relieve_aggregate_pressure
+            # will compact any over-fair-share session down when this turn runs.
+            # Reserving their live pos instead starved a 3rd tab the moment two
+            # others got deep.
+            with self._reg_lock:
+                reserved = sum(min(o.pos, self._fair_share)
+                               for o in self._sessions.values()
+                               if o is not s and o.state != SessionState.DEAD)
+            room = self._n_ctx - reserved - self._agg_margin
+            max_input = min(max_input, room - RESERVED_FOR_RESPONSE)
         if len(s.inbox_tokens) > max_input:
+            n_tokens = len(s.inbox_tokens)
             s.formatter.restore(s.formatter_cp_before_request)
             s.formatter_cp_before_request = None
             s.state = SessionState.IDLE
             s.inbox_tokens = []
             raise ValueError(
-                f"gate 1 bypassed: {len(s.inbox_tokens)} tokens > "
-                f"max_input {max_input}")
+                f"gate 1 bypassed: prompt is too long -- {n_tokens} tokens, "
+                f"but this conversation can accept at most {max(0, max_input)}")
         s.prefill_offset = 0
         s.produced = 0
         s.streamer = Utf8Streamer()
@@ -1278,19 +1350,53 @@ class Engine:
             C.llama_batch_free(batch)
 
     def _finish_turn(self, s, frame_type, reason):
-        # Record the completed exchange BEFORE the streamer is flushed, so the
-        # range covers exactly what went into the KV.
+        reply = bytes(s._reply_bytes).decode("utf-8", "replace")
+
+        # Chat templates that trim message content (gemma-3 does: `content |
+        # trim`) drop trailing whitespace the model emitted -- most often when
+        # the OUTPUT CAP cuts a reply mid-flow right after a space or newline.
+        # Left in the KV, those tokens make the formatter's _rendered (trimmed
+        # to match the template) and the KV disagree by a token or two, and the
+        # NEXT turn dies on the prefix check. Remove them so KV == _rendered.
+        stripped = reply.rstrip()
+        if stripped and stripped != reply:
+            try:
+                n_trim = (len(s.formatter._tokenize(reply, parse_special=False))
+                          - len(s.formatter._tokenize(stripped, parse_special=False)))
+            except Exception:
+                n_trim = 0
+            if 0 < n_trim < s.pos - s.pos_before_request:
+                C.llama_memory_seq_rm(self._alloc._mem, s.slot,
+                                      s.pos - n_trim, s.pos)
+                s.pos -= n_trim
+                reply = stripped
+
+        # BOOKKEEPING FIRST -- before any emit that can raise OutboxFull on a
+        # stalled reader. If the formatter update below is skipped by such a
+        # raise, the NEXT turn fails the prefix check one turn later, silently.
+        # The Turn's msg_index must be read before assistant_generated() appends
+        # the assistant message.
         s.turn_boundaries.append(
             Turn(s.pos_before_request, s.pos, "exchange",
                  len(s.formatter._messages)))   # index of the user msg
-        tail = s.streamer.flush()
-        if tail:
-            s.emit(FRAME_TOKEN, tail)
-        # Record what the model actually produced so the formatter's notion of
-        # the conversation matches the KV exactly. Skipping this would make the
-        # NEXT turn's delta wrong -- silently, with no error.
-        s.formatter.assistant_generated(
-            bytes(s._reply_bytes).decode("utf-8", "replace"))
+        s.formatter.assistant_generated(reply)
+
+        # Now the fallible part. A full outbox here must NOT prevent the
+        # terminal frame -- terminate() bypasses the bound for exactly that.
+        try:
+            tail = s.streamer.flush()
+            if tail:
+                s.emit(FRAME_TOKEN, tail)
+            # The C++ discards the FRAME_COMPLETE payload, so "why did it stop"
+            # is invisible to the client. On the output cap (not EOS) send a
+            # marker token first -- the panel strips it and shows a "hit the
+            # length limit" note instead of a reply that just trails off.
+            if frame_type == FRAME_COMPLETE and reason == "cap":
+                s.emit(FRAME_TOKEN, "\x00MALABR:cap")
+        except OutboxFull:
+            pass
+        print(f"malabr:   turn done ({reason}) produced~{len(s._reply_bytes)}B "
+              f"pos={s.pos}", file=sys.stderr, flush=True)
         s.terminate(frame_type, reason)
         s.state = SessionState.IDLE
         s.produced = 0
@@ -1310,17 +1416,21 @@ class Engine:
         """
         return s.pos >= s.budget * self.COMPACT_TRIGGER
 
-    def compact(self, s):
+    def compact(self, s, keep_recent=True):
         """Drop whole oldest exchanges, shifting EVERY live absolute position.
 
         Returns tokens freed. False-y result means nothing was droppable, which
         section 8 handles upstream by rejecting oversized input rather than
         letting compaction fail and deciding afterwards.
+
+        keep_recent=False is the shared-KV aggregate guard's last resort: drop
+        every exchange except the anchor, so a pool that would otherwise fail a
+        decode ("no memory slot") still makes room. Costs the most context.
         """
-        # Keep the anchor (index 0) and the most recent exchange. The anchor
-        # carries the template preamble and the first ~32 tokens act as
-        # attention anchors whose loss degrades output sharply.
-        droppable = s.turn_boundaries[1:-1]
+        # Keep the anchor (index 0); normally keep the most recent exchange too.
+        # The anchor carries the template preamble and the first ~32 tokens act
+        # as attention anchors whose loss degrades output sharply.
+        droppable = s.turn_boundaries[1:-1] if keep_recent else s.turn_boundaries[1:]
         freed = 0
         for turn in list(droppable):
             if freed >= self.TARGET_FREED_TOKENS:
@@ -1379,6 +1489,48 @@ class Engine:
             s.turn_boundaries.remove(turn)
             freed += n
         return freed
+
+    def _relieve_aggregate_pressure(self, sessions):
+        """Shared-KV: keep Sigma(live pos) under n_ctx by compacting.
+
+        Victim = the largest session ABOVE its fair share (n_ctx/n_seq_max), so
+        a small or foreground session is never shrunk to feed a greedy one. The
+        fair shares sum to exactly n_ctx, so an over-limit total always has such
+        a session -- unless several are stuck at the anchor+one-turn floor, in
+        which case fall back to the largest droppable one so a decode still
+        cannot hit "no memory slot".
+        """
+        live = [s for s in sessions if s.state != SessionState.DEAD]
+        if not live:
+            return
+        limit = self._n_ctx - self._agg_margin
+        if sum(s.pos for s in live) < limit:
+            return
+        before = sum(s.pos for s in live)
+        guard = 0
+        while sum(s.pos for s in live) >= limit and guard < 3 * len(live) + 4:
+            guard += 1
+            over = sorted((s for s in live if s.pos > self._fair_share),
+                          key=lambda s: s.pos, reverse=True)
+            pool = over or sorted(live, key=lambda s: s.pos, reverse=True)
+            freed = 0
+            for victim in pool:
+                freed = self.compact(victim)          # keep the recent turn
+                if not freed:
+                    freed = self.compact(victim, keep_recent=False)   # last resort
+                if freed:
+                    break
+            if not freed:
+                # Every over-limit session is down to just its anchor and the
+                # decode may still fail. Nothing more compaction can do -- the
+                # input gate should have kept the pool out of this state.
+                print("malabr: aggregate KV pressure unrelievable "
+                      f"(sum pos={sum(s.pos for s in live)}, n_ctx={self._n_ctx})",
+                      file=sys.stderr, flush=True)
+                return
+        print(f"malabr: aggregate guard compacted {before} -> "
+              f"{sum(s.pos for s in live)} (limit {limit})",
+              file=sys.stderr, flush=True)
 
     def _token_bytes(self, tok):
         import ctypes

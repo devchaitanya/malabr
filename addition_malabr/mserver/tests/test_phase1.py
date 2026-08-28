@@ -489,10 +489,37 @@ def t40_compaction_boundaries_clean():
     contiguous = all(s.turn_boundaries[i].end == s.turn_boundaries[i + 1].start
                      for i in range(len(s.turn_boundaries) - 1))
     ends_at_pos = s.turn_boundaries[-1].end == s.pos
-    formatter_agrees = len(s.formatter._tokenize(s.formatter._rendered)) == s.pos
+    formatter_agrees = len(s.formatter._tokenize(s.formatter._rendered, add_special=True)) == s.pos
     record(40, "compaction leaves no half-formed turn; formatter and KV agree",
            contiguous and ends_at_pos and formatter_agrees,
            f"contiguous={contiguous} ends_at_pos={ends_at_pos} formatter={formatter_agrees}")
+
+
+def t40b_shared_kv_aggregate_guard():
+    """Shared-KV: the aggregate guard keeps Sigma(pos) under n_ctx by compacting
+    the LARGEST over-fair-share session, leaving a small session alone."""
+    alloc, e = FIX.new_engine(shared_kv=True)
+    e.TARGET_FREED_TOKENS = 64
+    big = key(tab=1); small = key(tab=2)
+    sb, _ = e.get_or_create(big, FIX.formatter, eng.OutputCap([(0, 24)]))
+    ss, _ = e.get_or_create(small, FIX.formatter, eng.OutputCap([(0, 8)]))
+    for i in range(8):
+        ask(e, big, f"Tell me a short fact number {i}.")
+    ask(e, small, "Hi.")
+    big_before, small_before = sb.pos, ss.pos
+    fair = e._fair_share
+
+    # Tighten the pool so the current total is over the limit, then relieve.
+    e._n_ctx = big_before + small_before - 1
+    e._relieve_aggregate_pressure([sb, ss])
+
+    total_after = sb.pos + ss.pos
+    small_untouched = ss.pos == small_before          # small was below fair share
+    big_shrank = sb.pos < big_before
+    under_limit = total_after < e._n_ctx - e._agg_margin or sb.pos <= fair
+    record("40b", "shared-KV aggregate guard compacts the greedy session, not the small one",
+           small_untouched and big_shrank and under_limit,
+           f"big {big_before}->{sb.pos}, small {small_before}->{ss.pos}, fair={fair}")
 
 
 def t41_phase_c_is_real():
@@ -600,7 +627,7 @@ def t54_boundaries_across_two_compactions():
     e.compact(s)
     ok2 = all(s.turn_boundaries[i].end == s.turn_boundaries[i + 1].start
               for i in range(len(s.turn_boundaries) - 1))
-    agree = len(s.formatter._tokenize(s.formatter._rendered)) == s.pos
+    agree = len(s.formatter._tokenize(s.formatter._rendered, add_special=True)) == s.pos
     record(54, "untouched boundaries stay correct across TWO compaction passes",
            ok1 and ok2 and agree and s.turn_boundaries[-1].end == s.pos,
            f"pass1={ok1} pass2={ok2} formatter_agrees={agree}")

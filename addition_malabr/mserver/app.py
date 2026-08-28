@@ -42,7 +42,13 @@ def build(cfg, quick_calibration=False):
     # the context is created once with that value.
     result, measured = cal.load_or_run(cfg, eng.MIN_CAP, eng.ABSOLUTE_CEILING,
                                        quick=quick_calibration)
-    n_threads = result.get("n_threads") or cfg.n_threads
+    # An EXPLICIT MALABR_N_THREADS must win over the cached calibration's pick --
+    # otherwise the env var is silently a no-op whenever calibration.json exists,
+    # which is almost always.
+    if os.getenv("MALABR_N_THREADS"):
+        n_threads = cfg.n_threads
+    else:
+        n_threads = result.get("n_threads") or cfg.n_threads
 
     cp = C.llama_context_default_params()
     cp.n_ctx = cfg.n_ctx
@@ -50,6 +56,11 @@ def build(cfg, quick_calibration=False):
     cp.n_batch = cfg.n_batch
     cp.n_threads = n_threads
     cp.n_threads_batch = n_threads
+    if cfg.shared_kv and hasattr(cp, "kv_unified"):
+        # One shared pool of n_ctx cells instead of n_seq_max hard slices, so a
+        # session can grow past n_ctx/n_seq_max. The engine's aggregate guard is
+        # then what keeps the total within n_ctx.
+        cp.kv_unified = True
     ctx = C.llama_init_from_model(model, cp)
     if not ctx:
         raise RuntimeError("llama context creation failed")
@@ -58,11 +69,15 @@ def build(cfg, quick_calibration=False):
     mem = C.llama_get_memory(ctx)
     allocator = eng.SlotAllocator(mem, cfg.n_seq_max)
     engine = eng.Engine(ctx, model, vocab, allocator,
-                        sampling=eng.SAMPLING_CHAT)
+                        sampling=eng.SAMPLING_CHAT,
+                        n_ctx=cfg.n_ctx, n_seq_max=cfg.n_seq_max,
+                        shared_kv=cfg.shared_kv,
+                        session_budget=cfg.n_ctx_per_session)
     output_cap = cal.apply_to_engine(result, engine, eng)
 
     print(f"malabr: model={os.path.basename(cfg.model_path)} "
-          f"n_ctx={cfg.n_ctx} ({cfg.n_ctx_per_session}/session) "
+          f"n_ctx={cfg.n_ctx} ({cfg.n_ctx_per_session}/session"
+          f"{', shared-KV' if cfg.shared_kv else ''}) "
           f"n_seq_max={cfg.n_seq_max} n_threads={n_threads}", flush=True)
     print(f"malabr: calibration {'measured' if measured else 'loaded'}"
           f"{' (FALLBACK)' if result.get('fallback') else ''}"
