@@ -49,13 +49,15 @@ own both work; only one can hold `/tmp/malabr_v3.sck` at a time.
   - `MALABR_CPU_DUTY=0.5` -- PROGRESSIVE. The engine sleeps proportionally after
     each round; average CPU lands near n_threads * d, smoothly. Measured alone:
     3.0 -> 2.5 cores, tail latency p95 127ms.
-  - `MALABR_CPU_MAX="2"` (cores) or `"150%"` -- HARD. At startup the server
-    moves its OWN pid into a transient systemd scope with a kernel-enforced
-    cpu.max quota, via `busctl StartTransientUnit`. Same pid, so
-    MalabrManager's Terminate(pid) still lands; no intermediary to leak; the
-    empty scope is GC'd on exit -- verified: killing the pid cleans up with no
-    orphan. Measured alone: clamps to ~1.6 cores. With duty 0.5: ~2.1 cores
-    (duty pulls the mean down, the cap is the ceiling a spike can't cross).
+  - `MALABR_CPU_MAX` -- HARD, ON BY DEFAULT at a computed backstop value
+    (`max(logical//2, n_threads+1)`; 4 cores on this box). At startup the
+    server moves its OWN pid into a transient systemd scope with a
+    kernel-enforced cpu.max quota via `busctl StartTransientUnit`. Same pid,
+    so MalabrManager's Terminate(pid) still lands; no intermediary to leak;
+    the empty scope is GC'd on exit -- verified: killing the pid cleans up
+    with no orphan. The default never bites (decode uses n_threads=3 < 4), so
+    latency stays at the uncapped ~34ms p95. Override "N"/"N%"/"off"; a tight
+    value like "2" clamps to ~1.6 cores but then period-freezes the tail.
   - `n_threads` is the instantaneous ceiling on cores a single decode uses;
     `MALABR_N_THREADS` now actually takes effect (was overridden by cached
     calibration).
@@ -97,7 +99,7 @@ automated test:
     MALABR_SHARED_KV=1            one shared KV pool + aggregate cap (default via run_malabr.sh)
     MALABR_SESSION_SOFT_DIV=2     per-session soft cap = n_ctx / this
     MALABR_CPU_DUTY=0.5           PROGRESSIVE CPU throttle (engine sleeps between rounds)
-    MALABR_CPU_MAX=2             HARD CPU ceiling in cores (or "150%"); self-move into a systemd scope
+    MALABR_CPU_MAX=off          HARD CPU ceiling; default = max(logical//2, n_threads+1); self-move into a systemd scope
     MALABR_N_THREADS=N            now actually overrides calibration's pick
     MALABR_MODEL_PATH / _DIR      already existed; the panel's model switcher uses them
 
