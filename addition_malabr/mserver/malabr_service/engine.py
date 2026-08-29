@@ -1382,16 +1382,35 @@ class Engine:
         # trim`) drop trailing whitespace the model emitted -- most often when
         # the OUTPUT CAP cuts a reply mid-flow right after a space or newline.
         # Left in the KV, those tokens make the formatter's _rendered (trimmed
-        # to match the template) and the KV disagree by a token or two, and the
-        # NEXT turn dies on the prefix check. Remove them so KV == _rendered.
+        # to match the template) and the KV disagree, and the NEXT turn dies on
+        # the prefix check. Remove them so KV == _rendered.
         stripped = reply.rstrip()
-        if stripped and stripped != reply:
-            try:
-                n_trim = (len(s.formatter._tokenize(reply, parse_special=False))
-                          - len(s.formatter._tokenize(stripped, parse_special=False)))
-            except Exception:
-                n_trim = 0
-            if 0 < n_trim < s.pos - s.pos_before_request:
+        if stripped != reply:
+            # Only the tokens generated THIS turn are candidates -- never the
+            # user message or the generation prompt ahead of them.
+            reply_span = s.pos - s.pos_before_generation
+            if not stripped:
+                # The reply is ALL whitespace: the template renders it as an
+                # empty assistant message, so every generated token has to leave
+                # the KV. The old `stripped and` guard skipped this case, and
+                # the desync it left killed the session one turn later.
+                n_trim = reply_span
+            else:
+                try:
+                    full_toks = s.formatter._tokenize(reply, parse_special=False)
+                    keep_toks = s.formatter._tokenize(stripped, parse_special=False)
+                except Exception:
+                    full_toks = keep_toks = None
+                # Re-tokenising the concatenated bytes can disagree with the
+                # tokens the model actually sampled where the last real token
+                # touches the whitespace. Trust the diff ONLY when the stripped
+                # tokenisation is a clean prefix of the full one; otherwise a
+                # count would cut into content, so leave the KV alone.
+                if full_toks is not None and full_toks[:len(keep_toks)] == keep_toks:
+                    n_trim = len(full_toks) - len(keep_toks)
+                else:
+                    n_trim = 0
+            if 0 < n_trim <= reply_span:
                 C.llama_memory_seq_rm(self._alloc._mem, s.slot,
                                       s.pos - n_trim, s.pos)
                 s.pos -= n_trim

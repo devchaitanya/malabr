@@ -83,6 +83,25 @@ Claude/Anthropic attribution in commits. Server: hand-run from
    ALL whitespace (guarded by `stripped and`), n_trim computed wrong for a
    model whose whitespace merges into adjacent tokens, n_trim >= span. Verify
    `verify_against_full()` still holds after a trim, and formatter/KV agree.
+   -- FIXED. All three edge cases were real, one of them a session-killer:
+   * ALL-whitespace reply: the `stripped and` guard skipped the trim entirely,
+     so `assistant_generated()` recorded the raw whitespace while a trimming
+     template (gemma-3 `content | trim`) renders it as empty. Confirmed against
+     gemma-3-1b: the next `user_turn` fails `full.startswith(_rendered)` and the
+     session is torn down with "conversation state was lost -- start a new
+     chat". Fix: drop the `stripped and` guard; when `stripped == ""` set
+     `n_trim = reply_span` so every generated token leaves the KV.
+   * BPE boundary merge: `n_trim` from re-tokenising the concatenated bytes can
+     disagree with the tokens actually sampled, cutting into real content. Fix:
+     trim only when `tok(stripped)` is a clean PREFIX of `tok(reply)`; otherwise
+     leave the KV alone (a stray trailing-whitespace token is harmless -- the
+     text-based prefix check still passes -- whereas a bad cut is not).
+   * n_trim >= span: the guard bounded `n_trim` by `s.pos - s.pos_before_request`
+     (the whole turn, incl. the user message + generation prompt). Tightened to
+     `s.pos - s.pos_before_generation` (the reply span only) so a pathological
+     count can never `seq_rm` into the prompt.
+   Regression: test 06b locks the trim math on Qwen; the gemma desync path is
+   verified offline (two models in one suite process is flaky).
 
 5. **`_apply_control` TemplateError -> teardown.** New path. Confirm the
    session's slot is released (`_teardown` -> `_alloc.release`), the client

@@ -145,6 +145,61 @@ def t06_output_cap():
            bool(term) and term[-1][1] == "cap", f"terminal={term[-1] if term else None}")
 
 
+def t06b_finish_turn_whitespace_trim_math():
+    """_finish_turn's trailing-whitespace KV trim, model-independent half.
+
+    A template that trims message content (gemma-3: `content | trim`) renders an
+    all-whitespace reply as empty, so those tokens must leave the KV or the next
+    turn's prefix check kills the session. That desync path is gemma-only and was
+    verified offline; here the trim MATH is locked on the Qwen fixture:
+      * an all-whitespace reply removes exactly the generated span from the KV,
+      * a normal reply with a trailing newline removes only the newline,
+      * the guard bounds n_trim by the REPLY span (pos_before_generation), never
+        the whole turn, so it can never seq_rm into the prompt.
+    After each, seq_pos_max must equal len(tokens(_rendered)) - 1 (KV == render).
+    """
+    def kvmax(e, s):
+        return C.llama_memory_seq_pos_max(FIX.mem, s.slot)
+
+    outcomes = []
+    for reply_text, expect_span_removed in (("  \n", "all"), ("hi there\n", "one")):
+        alloc, e = FIX.new_engine()
+        k = key(tab=1)
+        s, _ = e.get_or_create(k, FIX.formatter, eng.OutputCap([(0, 64)]))
+        ask(e, k, "Say hi briefly.")
+        e.submit(k, "Say something short.")
+        for _ in range(300):
+            e._step()
+            if s.state == eng.SessionState.GENERATING:
+                break
+        if s.pos > s.pos_before_generation:
+            C.llama_memory_seq_rm(e._alloc._mem, s.slot,
+                                  s.pos_before_generation, s.pos)
+            s.pos = s.pos_before_generation
+        gen_start = s.pos_before_generation
+        toks = s.formatter._tokenize(reply_text, parse_special=False)
+        for t in toks:
+            e._decode_batch([(t, s.pos, s.slot, True)])
+            s.pos += 1
+        s._reply_bytes = bytearray(reply_text.encode())
+        s.produced = len(toks)
+        e._finish_turn(s, eng.FRAME_COMPLETE, "cap")
+
+        removed = gen_start + len(toks) - s.pos
+        if expect_span_removed == "all":
+            span_ok = s.pos == gen_start and removed == len(toks)
+        else:
+            keep = s.formatter._tokenize(reply_text.rstrip(), parse_special=False)
+            span_ok = removed == len(toks) - len(keep) and s.pos > gen_start
+        kv_ok = kvmax(e, s) == len(
+            s.formatter._tokenize(s.formatter._rendered, add_special=True)) - 1
+        bound_ok = s.pos >= gen_start          # never trimmed past the reply
+        outcomes.append(span_ok and kv_ok and bound_ok)
+
+    record("06b", "_finish_turn whitespace trim removes the right span and keeps KV==render",
+           all(outcomes), f"[all-ws, trailing-nl] = {outcomes}")
+
+
 def t07_admission_at_exhaustion():
     alloc, e = FIX.new_engine()
     made = [e.get_or_create(key(tab=i, origin=f"https://s{i}.test"),
