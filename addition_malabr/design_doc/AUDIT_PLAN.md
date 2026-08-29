@@ -224,6 +224,18 @@ Claude/Anthropic attribution in commits. Server: hand-run from
     called on the engine thread from `_run_round` with a `sessions` list
     snapshotted under the lock, but `s.pos` is mutated by the engine thread
     itself -- fine. Confirm no connection-thread writes `s.pos`.
+    -- UNFOUNDED, confirmed by enumerating every `s.pos` assignment in engine.py:
+    `Session.__init__` (pre-registration, not yet visible), `_run_round` x2,
+    `_roll_back_partial`, `_finish_turn`, `compact` -- all engine-thread only.
+    Every connection-thread entry point (`get_or_create`, `evict_other_origins`,
+    `cancel`, `stop_generation`, `submit`, `wait_for_teardown`, the `set_*` and
+    `keys_*` helpers) sets flags or reads state; none touches `.pos`.
+    `get_or_create` constructs a `Session` (pos=0) on the connection thread but
+    only publishes it into `_sessions` under `_reg_lock`, and `_run_round`'s
+    snapshot is taken under the same lock, so there is no torn read. `_reg_lock`
+    guards the dict, not the fields; the fields are engine-thread-exclusive by
+    construction. Regression: structural test 30b (fails if any connection-
+    thread method grows a `.pos` assignment).
 
 12. **§12 tests 40b / harness `session_budget` default.** Harness non-shared
     default is a hardcoded 2048; if a test sets `n_ctx` such that

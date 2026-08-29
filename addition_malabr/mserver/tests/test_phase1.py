@@ -636,6 +636,29 @@ def t30_throttle_check_in_thread():
            in_loop and not spawns, f"in_loop={in_loop} spawns_thread={spawns}")
 
 
+def t30b_connection_threads_never_write_session_pos():
+    """Audit item 11: _relieve_aggregate_pressure reads s.pos without _reg_lock.
+    That is safe ONLY while s.pos is engine-thread-exclusive. Structural guard:
+    no method reachable from a connection thread (registry ops, cancel, submit,
+    stop_generation, eviction, visibility) may assign s.pos -- _reg_lock guards
+    the _sessions dict, not the fields of a Session."""
+    import inspect
+    import re
+    conn_thread_methods = [
+        eng.Engine.get_or_create, eng.Engine.evict_other_origins,
+        eng.Engine.cancel, eng.Engine.stop_generation, eng.Engine.submit,
+        eng.Engine.wait_for_teardown, eng.Engine.set_control_connected,
+        eng.Engine.all_keys, eng.Engine.keys_for_tab, eng.Engine.keys_for_extension,
+        eng.Engine.effective_foreground_tab_id,
+    ]
+    # `.pos` on the left of a plain or augmented assignment, but not ==/<=/>=/!=
+    writes = re.compile(r"\.pos\s*(?:[-+*/]?=)(?!=)")
+    offenders = [m.__name__ for m in conn_thread_methods
+                 if writes.search(inspect.getsource(m))]
+    record("30b", "no connection-thread method assigns Session.pos",
+           offenders == [], f"offenders={offenders}")
+
+
 def t31_cap_table_is_calibration_output():
     import inspect
     src = inspect.getsource(eng.OutputCap.for_position)
