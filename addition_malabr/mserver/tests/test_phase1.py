@@ -889,8 +889,9 @@ def t40f_harness_budget_matches_production():
     """Audit item 12: the harness must hand the engine the SAME per-session
     budget config.n_ctx_per_session computes, or needs_compaction()'s trigger
     drifts from the KV it is protecting. Non-shared = n_ctx // n_seq_max (the
-    partitioned per-sequence limit); shared-KV = n_ctx // 2."""
-    _, e_part = FIX.new_engine()
+    partitioned per-sequence limit); shared-KV = n_ctx // 2. Pass both modes
+    explicitly so this holds under MALABR_TEST_SHARED_KV=1 too (item 13)."""
+    _, e_part = FIX.new_engine(shared_kv=False)
     _, e_shared = FIX.new_engine(shared_kv=True)
     part_ok = e_part._session_budget == FIX.n_ctx // FIX.n_seq_max
     shared_ok = e_shared._session_budget == FIX.n_ctx // 2

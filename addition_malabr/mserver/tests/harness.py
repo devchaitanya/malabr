@@ -54,7 +54,14 @@ class Fixture:
         self.n_seq_max = n_seq_max
         self.n_ctx = n_ctx
 
-    def new_engine(self, sampling=None, shared_kv=False, session_budget=None):
+    def new_engine(self, sampling=None, shared_kv=None, session_budget=None):
+        # shared_kv=None means "test's choice": partitioned by default, but a
+        # whole-suite shared-KV pass is available via MALABR_TEST_SHARED_KV=1
+        # (audit item 13 -- prove the aggregate-guard / soft-cap / input-gate
+        # branches change no observable behaviour). Tests that pass an explicit
+        # True/False are honoured as-is.
+        if shared_kv is None:
+            shared_kv = os.getenv("MALABR_TEST_SHARED_KV") == "1"
         alloc = eng.SlotAllocator(self.mem, self.n_seq_max)
         if session_budget is None:
             # Match production (config.n_ctx_per_session): non-shared is the

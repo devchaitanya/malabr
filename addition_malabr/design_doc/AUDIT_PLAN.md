@@ -255,6 +255,15 @@ Claude/Anthropic attribution in commits. Server: hand-run from
     second pass). The suite currently runs partitioned only; shared-KV changes
     `Session.budget`, adds the aggregate guard call in `_run_round`, and the
     input-gate branch. Nothing should differ, but prove it.
+    -- DONE. `harness.new_engine(shared_kv=None)` now reads
+    `MALABR_TEST_SHARED_KV=1` for a whole-suite second pass (explicit
+    True/False in a test still wins). Both passes are green and identical: the
+    aggregate guard is a no-op while Sigma(pos) < n_ctx-64 (every non-shared
+    test stays far under), and the shared-KV `_begin_turn` input gate computes
+    the same `max_input` as the partitioned path for a single session and for
+    the small multi-session tests. Only t40f -- which asserts the two budget
+    formulas -- had to be pinned to explicit modes so it does not read the
+    flipped default. The default suite run stays partitioned, by design.
 
 ## Known-not-a-bug (do not re-flag)
 
