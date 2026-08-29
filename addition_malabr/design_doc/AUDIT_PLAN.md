@@ -127,6 +127,24 @@ Claude/Anthropic attribution in commits. Server: hand-run from
    GENERATING. Their request sockets get connection-reset; the C++ side should
    surface an error frame, not hang. The control connection reconnects. Verify
    no half-written frames, no zombie state in the new process.
+   -- Mostly browser-side (frame reader must treat a short read as an error;
+   control channel resync is test 57, browser-skip). Reasoned through the
+   Python side:
+   * Python sockets are CLOEXEC by default, so `os.execv` closes every session
+     request socket and the control socket -- exactly the connection-reset the
+     clients need. No frame keeps being written: `execv` replaces the whole
+     image, pool-worker threads included.
+   * No zombie state: KV lives in process memory and goes with the image; the
+     listen socket and pidfile are both unlinked before `execv`.
+   * FOUND one real fragility. `os.execv` keeps the pid (deliberately -- so
+     MalabrManager's `Terminate(pid)` still lands). `_reexec_with_model`
+     unlinks the pidfile first, but best-effort (`except OSError`). If that
+     unlink ever fails, the re-exec'd process runs `PidLock.acquire()`, reads a
+     pidfile naming its OWN pid, `_alive()` says yes (it is us), and it refuses
+     to start -- the switch leaves a dead server. Fix: `acquire()` treats
+     `existing == os.getpid()` as unambiguously stale (a live foreign instance
+     can never hold our pid) and reclaims it. Regression: test 29b; test 29
+     rewritten to use a real foreign process for the genuine-rival case.
 
 7. **`sending` latch 10s timeout (content.js).** If `generate()`'s callback
    takes >10s to return the id (very large prompt, slow first token), the latch

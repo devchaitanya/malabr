@@ -64,7 +64,14 @@ class PidLock:
 
     def acquire(self):
         existing = self._read()
-        if existing is not None and self._alive(existing):
+        # A pidfile naming OUR OWN pid can only be our re-exec predecessor:
+        # os.execv keeps the pid, and the model switcher relies on that. It
+        # unlinks the pidfile before exec, but that is best-effort (wrapped in
+        # OSError), and if it ever fails the _alive() check below would see the
+        # pid as live -- because it is us -- and refuse to start, leaving the
+        # switch with a dead server. A live foreign instance can never hold our
+        # pid, so this is unambiguously stale: reclaim it.
+        if existing is not None and existing != os.getpid() and self._alive(existing):
             raise SingleInstanceError(
                 f"another malabr server is running (pid {existing})")
         tmp = f"{self.path}.{os.getpid()}.tmp"

@@ -502,15 +502,41 @@ def t28_compaction_bug_containment():
 
 def t29_single_instance():
     import tempfile
+    import subprocess
     d = tempfile.mkdtemp(); p = os.path.join(d, "x.pid")
-    a = rt.PidLock(p); a.acquire()
-    refused = False
+    # A genuine FOREIGN live instance: a real other process, not this one. The
+    # old test wrote its own pid, which only "refused" because acquire() used to
+    # treat our own re-exec pid as a rival -- the exact case t29b now covers.
+    other = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
     try:
-        rt.PidLock(p).acquire()
-    except rt.SingleInstanceError:
-        refused = True
+        with open(p, "w") as fh:
+            fh.write(str(other.pid))
+        refused = False
+        try:
+            rt.PidLock(p).acquire()
+        except rt.SingleInstanceError:
+            refused = True
+    finally:
+        other.terminate(); other.wait()
     record(29, "second instance refuses to start rather than stealing the socket",
            refused)
+
+
+def t29b_reexec_reclaims_its_own_pidfile():
+    """os.execv keeps the pid, so after a model-switch re-exec the new process
+    can find a pidfile naming its own pid if the pre-exec unlink lost the race.
+    acquire() must reclaim it, not deadlock against itself."""
+    import tempfile
+    d = tempfile.mkdtemp(); p = os.path.join(d, "x.pid")
+    with open(p, "w") as fh:
+        fh.write(str(os.getpid()))          # as our re-exec predecessor left it
+    reclaimed = False
+    try:
+        lk = rt.PidLock(p); lk.acquire()
+        reclaimed = lk._read() == os.getpid() and lk._acquired
+    except rt.SingleInstanceError:
+        reclaimed = False
+    record("29b", "a re-exec reclaims a pidfile that names its own pid", reclaimed)
 
 
 def t30_throttle_check_in_thread():
