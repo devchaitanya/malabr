@@ -204,6 +204,21 @@ Claude/Anthropic attribution in commits. Server: hand-run from
     iteration bound while still over `limit`, it silently returns and the next
     decode may fail "no memory slot". Confirm the bound is generous enough, or
     have it fall through to rejecting the pending turn.
+    -- The bound is fine in STEADY STATE (the guard runs every round, and
+    Sigma(pos) cannot jump far past `limit` between rounds -- prefill is chunked
+    to ~50ms, decode is +1/session, `n_ctx` is capped at 16384). It is only at
+    risk on a discontinuity. But the concern is legitimate as robustness: the
+    old code had TWO paths that returned still-over-limit (bound exhausted, and
+    `if not freed: return` when every session is at its anchor floor), and both
+    let the next `llama_decode` fail "no memory slot" -> RuntimeError ->
+    round-failure retry.
+    -- FIXED per the audit's own suggestion: `if not freed` now `break`s instead
+    of returning, and after the loop, if still `>= limit`, the guard calls
+    `_reject_pending_for_capacity()` -- rolls back PENDING turns (largest first,
+    they have produced nothing) with one "server is at capacity -- try again"
+    FRAME_ERROR until the pool is safe to decode. GENERATING streams are left
+    untouched. Only if even that is not enough does it log "unrelievable" and
+    return. Regression: test 40e.
 
 11. **`_relieve_aggregate_pressure` reads `s.pos` without `_reg_lock`.** It is
     called on the engine thread from `_run_round` with a `sessions` list

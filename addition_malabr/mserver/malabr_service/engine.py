@@ -1574,16 +1574,44 @@ class Engine:
                 if freed:
                     break
             if not freed:
-                # Every over-limit session is down to just its anchor and the
-                # decode may still fail. Nothing more compaction can do -- the
-                # input gate should have kept the pool out of this state.
+                break                                # compaction is spent
+
+        remaining = sum(s.pos for s in live)
+        if remaining >= limit:
+            # Compaction could not claw the pool back under n_ctx: the iteration
+            # bound was hit, or every session is down to its anchor. Returning
+            # here would leave the next llama_decode to fail "no memory slot"
+            # and the round to enter the failure-retry loop. Instead reject the
+            # turns that have produced NOTHING yet -- a PENDING session rolls
+            # back cleanly and its client gets one honest "at capacity" frame.
+            rejected = self._reject_pending_for_capacity(live, limit)
+            remaining = sum(s.pos for s in live)
+            if remaining >= limit:
                 print("malabr: aggregate KV pressure unrelievable "
-                      f"(sum pos={sum(s.pos for s in live)}, n_ctx={self._n_ctx})",
+                      f"(sum pos={remaining}, n_ctx={self._n_ctx}, "
+                      f"rejected {rejected} pending)",
                       file=sys.stderr, flush=True)
                 return
-        print(f"malabr: aggregate guard compacted {before} -> "
-              f"{sum(s.pos for s in live)} (limit {limit})",
-              file=sys.stderr, flush=True)
+        print(f"malabr: aggregate guard compacted {before} -> {remaining} "
+              f"(limit {limit})", file=sys.stderr, flush=True)
+
+    def _reject_pending_for_capacity(self, live, limit):
+        """Roll back PENDING turns, largest first, until the shared pool is back
+        under n_ctx. They have generated nothing, so a rollback plus one
+        FRAME_ERROR is clean and recoverable -- letting the decode fail is not.
+        GENERATING sessions are left alone: killing a stream the user is
+        watching to make room for someone else's turn is the worse trade.
+        """
+        pending = sorted((s for s in live if s.state == SessionState.PENDING),
+                         key=lambda s: s.pos, reverse=True)
+        rejected = 0
+        for s in pending:
+            if sum(o.pos for o in live) < limit:
+                break
+            self._roll_back_partial(s)
+            s.terminate(FRAME_ERROR, "server is at capacity -- try again")
+            rejected += 1
+        return rejected
 
     def _token_bytes(self, tok):
         import ctypes

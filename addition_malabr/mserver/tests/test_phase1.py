@@ -815,6 +815,53 @@ def t40d_agg_guard_last_resort_on_idle_session():
            f"pos={s.pos} end={s.turn_boundaries[-1].end}")
 
 
+def t40e_agg_guard_rejects_pending_when_compaction_is_spent():
+    """Aggregate guard iteration/anchor-floor exhaustion. When compaction cannot
+    claw Sigma(pos) back under n_ctx, the guard must NOT just return and let the
+    next llama_decode fail 'no memory slot' (round-failure retry loop). It rolls
+    back the PENDING turns -- which have produced nothing -- with one honest
+    FRAME_ERROR, so the pool is safe to decode."""
+    alloc, e = FIX.new_engine(shared_kv=True)
+    a, b, c = key(tab=1), key(tab=2), key(tab=3)
+    sa, _ = e.get_or_create(a, FIX.formatter, eng.OutputCap([(0, 8)]))
+    sb, _ = e.get_or_create(b, FIX.formatter, eng.OutputCap([(0, 8)]))
+    sc, _ = e.get_or_create(c, FIX.formatter, eng.OutputCap([(0, 8)]))
+    ask(e, a, "Say hi.")                       # sa, sb: one anchor turn, IDLE
+    ask(e, b, "Say hi.")
+    # sc: a PENDING turn with real prefilled tokens
+    ob = e.submit(c, "word " * 60)
+    e._apply_control()
+    for _ in range(6):
+        e._step()
+        if sc.state == eng.SessionState.PENDING and sc.pos > sc.pos_before_request:
+            break
+    live = [sa, sb, sc]
+    # n_ctx admits the two anchors but not the pending prefill on top; the
+    # anchors themselves are not compactable (one boundary each), so the guard
+    # exhausts and must fall through to rejecting the pending turn.
+    e._n_ctx = sa.pos + sb.pos + 8
+    e._agg_margin = 0
+    e._fair_share = max(1, e._n_ctx // 4)
+    limit = e._n_ctx
+    over_before = sum(x.pos for x in live) >= limit
+
+    e._relieve_aggregate_pressure(live)
+
+    err = None
+    while not ob.empty():
+        t, p = ob.get_nowait()
+        if t == eng.FRAME_ERROR:
+            err = p
+    ok = (over_before
+          and sc.state == eng.SessionState.IDLE
+          and sc.pos == sc.pos_before_request
+          and err is not None and "capacity" in err
+          and sum(x.pos for x in live) < limit)
+    record("40e", "aggregate guard rejects the pending turn instead of a decode failure",
+           ok, f"over_before={over_before} sc.state={sc.state} err={err!r} "
+               f"sum_after={sum(x.pos for x in live)} limit={limit}")
+
+
 def t41_phase_c_is_real():
     import inspect
     src = inspect.getsource(cal.phase_c_joint_worst_case)
