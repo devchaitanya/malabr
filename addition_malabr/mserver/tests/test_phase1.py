@@ -88,6 +88,70 @@ def t03_new_chat():
            not recalls_canary(out), f"said: {(out or '')[:70]!r}")
 
 
+def t03b_template_error_in_begin_turn_tears_down_cleanly():
+    """New path: _begin_turn -> user_turn raises TemplateError (formatter/KV
+    desync). The session must be torn down -- slot released, removed from the
+    registry -- the client must get EXACTLY ONE terminal frame, and a fresh
+    session on the same key must start clean. A supersede that then hits the
+    same error must send 'superseded' to the OLD client and one 'lost' frame to
+    the NEW one, never two frames to either."""
+    def boom(_text):
+        raise eng.TemplateError("synthetic desync")
+
+    # -- IDLE session --
+    alloc, e = FIX.new_engine()
+    k = key(tab=1)
+    s, _ = e.get_or_create(k, FIX.formatter, eng.OutputCap([(0, 16)]))
+    ask(e, k, "Say hi.")
+    in_use = e._alloc.in_use_count
+    s.formatter.user_turn = boom
+    ob = e.submit(k, "trigger it")
+    e._apply_control()
+    frames = []
+    while not ob.empty():
+        frames.append(ob.get_nowait())
+    errs = [p for t, p in frames if t == eng.FRAME_ERROR]
+    idle_ok = (len(errs) == 1 and "start a new chat" in errs[0]
+               and e._sessions.get(k) is None
+               and e._alloc.in_use_count == in_use - 1
+               and s.state == eng.SessionState.DEAD)
+    s_fresh, _ = e.get_or_create(k, FIX.formatter, eng.OutputCap([(0, 24)]))
+    fresh_frames = drive(e, e.submit(k, "Say the word READY."), limit=300)
+    fresh_ok = (s_fresh is not None and s_fresh.slot is not None
+                and not any(t == eng.FRAME_ERROR for t, _ in fresh_frames)
+                and any(t == eng.FRAME_COMPLETE for t, _ in fresh_frames))
+
+    # -- GENERATING session, superseded, then the error --
+    alloc, e = FIX.new_engine()
+    k = key(tab=2)
+    s, _ = e.get_or_create(k, FIX.formatter, eng.OutputCap([(0, 200)]))
+    ask(e, k, "Say hi.")
+    ob_old = e.submit(k, "Count to five hundred slowly.")
+    for _ in range(80):
+        e._step()
+        if s.state == eng.SessionState.GENERATING:
+            break
+    in_use = e._alloc.in_use_count
+    s.formatter.user_turn = boom
+    ob_new = e.submit(k, "new prompt")
+    e._apply_control()
+    def errs_of(q):
+        out = []
+        while not q.empty():
+            t, p = q.get_nowait()
+            if t == eng.FRAME_ERROR:
+                out.append(p)
+        return out
+    eo, en = errs_of(ob_old), errs_of(ob_new)
+    supersede_ok = (eo == ["superseded"] and len(en) == 1
+                    and "start a new chat" in en[0]
+                    and e._sessions.get(k) is None
+                    and e._alloc.in_use_count == in_use - 1)
+    record("03b", "TemplateError in _begin_turn: one frame, slot freed, clean restart",
+           idle_ok and fresh_ok and supersede_ok,
+           f"idle_ok={idle_ok} fresh_ok={fresh_ok} supersede_ok={supersede_ok}")
+
+
 def t04_compaction_fidelity():
     alloc, e = FIX.new_engine()
     k = key(tab=1)

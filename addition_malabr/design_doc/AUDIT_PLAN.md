@@ -107,6 +107,21 @@ Claude/Anthropic attribution in commits. Server: hand-run from
    session's slot is released (`_teardown` -> `_alloc.release`), the client
    gets exactly one FRAME_ERROR, and a NEW session on the same key afterwards
    starts clean.
+   -- UNFOUNDED, path is correct. Verified two ways (Qwen, TemplateError forced
+   by monkeypatching `user_turn`):
+   * IDLE session -> `_begin_turn` raises: exactly one FRAME_ERROR
+     ("conversation state was lost -- start a new chat"), session removed from
+     the registry, slot `_alloc.release`d (in_use 1 -> 0), state DEAD; a fresh
+     `get_or_create` on the same key gets a clean slot and runs a turn to
+     FRAME_COMPLETE.
+   * GENERATING session superseded, then `_begin_turn` raises: the OLD outbox
+     gets exactly one "superseded", the NEW outbox exactly one "...start a new
+     chat" -- never two frames to either. The outbox swap in `_begin_turn`
+     happens before `user_turn`, so the two terminal frames always land on
+     different queues. Slot released, session removed.
+   Slot re-wipe on the next acquire is guaranteed by SlotAllocator (release ->
+   _free -> acquire re-arms pending_wipe -> prepare wipes+verifies), so the new
+   session cannot see the dead one's KV. Regression: test 03b.
 
 6. **Model-switch re-exec mid-generation.** `os.execv` while other sessions are
    GENERATING. Their request sockets get connection-reset; the C++ side should
