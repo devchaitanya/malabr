@@ -5,6 +5,13 @@ fix. Suite must stay 46/46 (`python tests/test_phase1.py` from `mserver/`). No
 Claude/Anthropic attribution in commits. Server: hand-run from
 `addition_malabr/mserver` with `MALABR_SHARED_KV=1`.
 
+## STATUS: complete (all 13 items, one commit each, f4dfc70..6e99f04)
+
+8 real fixes (items 1, 2, 4, 6, 8, 9, 10, 12), 5 unfounded-but-confirmed
+(3, 5, 7, 11, 13). Suite 46 -> 57 (11 regression tests added), green in BOTH
+partitioned and `MALABR_TEST_SHARED_KV=1` modes. Per-item findings inline below.
+Test venv: `/home/chaitu/Desktop/vscode/malabr/bin/python`.
+
 ## Method per item
 
 1. Read the code against its design section (`phase1_design.md`,
