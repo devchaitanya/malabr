@@ -350,6 +350,14 @@
                                    // guard and opens a parallel generation --
                                    // section 6b allows exactly one per session.
 
+  // How long to wait for generate()'s callback (which only hands back the
+  // request id -- tokens arrive separately on onToken) before assuming the
+  // extension message was dropped. Must exceed any legitimate round-trip: on a
+  // CPU-saturated box under a large prompt the old 10s could expire while the
+  // call was still healthy, dropping `sending` and letting a second Enter open
+  // the parallel generation the latch exists to stop. Shared with meta().
+  const GENERATE_ACK_TIMEOUT_MS = 15000;
+
   // ---- model switcher ---------------------------------------------------
   // The page-facing API is only generate()/stop(), so a control command rides
   // IN a generate() call: the prompt is the sentinel below, and the server
@@ -362,7 +370,7 @@
       let settled = false;
       const t = setTimeout(() => {
         if (!settled) { settled = true; reject(new Error("meta timeout")); }
-      }, 15000);
+      }, GENERATE_ACK_TIMEOUT_MS);
       const fin = (fn) => (v) => {
         if (settled) return;
         settled = true; clearTimeout(t); fn(v);
@@ -596,8 +604,16 @@
     }
     sending = true;
     // Safety net: if generate()'s callback never comes back (dropped extension
-    // message), don't leave the composer locked forever.
-    const sendingGuard = setTimeout(() => { sending = false; }, 10000);
+    // message), don't leave the composer locked forever. On expiry also tear
+    // down this turn's half-open UI, so the next Enter starts genuinely fresh
+    // instead of racing a callback that might still be in flight.
+    const sendingGuard = setTimeout(() => {
+      if (!sending) return;
+      sending = false;
+      note(turn, "the server did not respond — try again", "err");
+      turn.querySelector(".body")?.classList.remove("caret");
+      setBusy(false);
+    }, GENERATE_ACK_TIMEOUT_MS);
     ta.value = ""; ta.style.height = "auto";
 
     let prompt = typed;

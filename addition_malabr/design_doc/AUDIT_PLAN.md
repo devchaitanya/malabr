@@ -151,6 +151,18 @@ Claude/Anthropic attribution in commits. Server: hand-run from
    clears and a second Enter can open a parallel generation -- the exact bug
    the latch fixes. Either bump to `frame_read_timeout_seconds` or clear the
    latch only on real completion. Browser-only to observe; reason about it.
+   -- Reasoned + hardened (browser-only, no suite test possible). `generate()`'s
+   callback carries ONLY the request id -- tokens/completion arrive separately
+   on `onToken`/`onComplete` -- so a correct C++ impl returns it in ms and the
+   window is not normally reachable. But "clear the latch only on real
+   completion" is not an option: the guard exists precisely because the
+   callback may NEVER fire (dropped extension message). So: (a) 10000 -> a named
+   `GENERATE_ACK_TIMEOUT_MS = 15000`, matching the value `meta()` already uses
+   in the same file for the same round-trip, so the net cannot trip on a merely
+   slow call on a CPU-saturated box; (b) on expiry the guard now also tears
+   down the half-open turn (error note, drop the caret, `setBusy(false)`) so the
+   next Enter starts genuinely fresh instead of racing a late callback into a
+   parallel generation. Idempotent via an `if (!sending) return` head.
 
 8. **"New chat" does not tear down the server session** (client, contradicts
    §3 "full teardown, not a display clear"). Either wire a real teardown
