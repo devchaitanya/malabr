@@ -5,6 +5,8 @@ Launched by MalabrManager as `python3 addition_malabr/mserver/app.py`
 (chrome/browser/malabr_manager.cc:36).
 
 Startup order matters and is not arbitrary:
+  0. config, then the single-instance check, THEN the CPU ceiling -- a rejected
+     second start must not create a systemd scope it will never use
   1. config      -- sizing computed from THIS machine, not baked in
   2. model+ctx   -- one context, created once, owned by the engine thread
   3. calibration -- measured or loaded from disk; feeds the scheduler
@@ -69,14 +71,48 @@ def apply_cpu_ceiling(cores):
              "CPUQuotaPerSecUSec", "t", str(usec_per_sec),
              "0"],
             capture_output=True, text=True, timeout=10)
-        if r.returncode == 0:
+        if r.returncode != 0:
+            print(f"malabr: CPU ceiling not applied: {r.stderr.strip()}",
+                  file=sys.stderr, flush=True)
+        elif _cpu_max_quota_active():
             print(f"malabr: CPU ceiling {cores:g} cores applied "
                   f"(cpu.max quota {usec_per_sec}us/s)", file=sys.stderr, flush=True)
         else:
-            print(f"malabr: CPU ceiling not applied: {r.stderr.strip()}",
+            # busctl returned 0 but there is no cpu.max quota on our cgroup.
+            # systemd does this silently when the cpu controller is not
+            # delegated to the user session -- the scope exists, the ceiling
+            # does not. Say so rather than log a false success.
+            print("malabr: CPU ceiling scope created but no cpu.max quota is in "
+                  "force -- running unthrottled (the duty throttle still applies)",
                   file=sys.stderr, flush=True)
     except (OSError, subprocess.SubprocessError) as exc:
         print(f"malabr: CPU ceiling not applied ({exc})", file=sys.stderr, flush=True)
+
+
+def _cpu_max_quota_active():
+    """Read back the effective cpu.max after StartTransientUnit succeeds.
+
+    A zero return code from busctl is not proof the quota exists: systemd will
+    create the scope and drop the CPU property without error when the cpu
+    controller is not delegated to the user session. The move into the new
+    scope can lag the call slightly, so retry briefly.
+    """
+    import time as _t
+    for _ in range(15):
+        try:
+            cg = None
+            for line in open("/proc/self/cgroup").read().splitlines():
+                if line.startswith("0::"):
+                    cg = line[3:].strip()
+                    break
+            if cg is not None:
+                with open("/sys/fs/cgroup" + cg + "/cpu.max") as fh:
+                    if fh.read().split()[0] != "max":
+                        return True         # a numeric quota is enforcing
+        except (OSError, IndexError):
+            pass
+        _t.sleep(0.02)
+    return False
 
 
 def build(cfg, quick_calibration=False):
@@ -146,7 +182,6 @@ def build(cfg, quick_calibration=False):
 
 def main():
     cfg = load_config()
-    apply_cpu_ceiling(cfg.cpu_max_cores)   # before anything heavy, calibration included
     quick = os.getenv("MALABR_QUICK_CALIBRATION") == "1"
     model = ctx = engine = None
     try:
@@ -154,13 +189,16 @@ def main():
         # is spawned by MalabrManager, so an unhandled traceback here is noise
         # in the Chrome log for a condition that is expected (a browser restart
         # that did not confirm the old child died). Exit 3 distinguishes it from
-        # a real crash.
+        # a real crash. MUST come before apply_cpu_ceiling: otherwise a rejected
+        # second start still spins up a transient systemd scope (and can block
+        # up to busctl's 10s timeout) before finding out it has no work to do.
         probe = rt.PidLock(cfg.socket_path + ".pid")
         existing = probe._read()
         if existing is not None and probe._alive(existing) and existing != os.getpid():
             print(f"malabr: another server is already running (pid {existing}); "
                   f"exiting", file=sys.stderr, flush=True)
             return 3
+        apply_cpu_ceiling(cfg.cpu_max_cores)   # before anything heavy, calibration included
         model, ctx, engine, output_cap = build(cfg, quick_calibration=quick)
         engine.start()
         rt.run_server(config=cfg, engine=engine,

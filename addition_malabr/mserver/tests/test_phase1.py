@@ -596,6 +596,36 @@ def t29b_reexec_reclaims_its_own_pidfile():
     record("29b", "a re-exec reclaims a pidfile that names its own pid", reclaimed)
 
 
+def t29c_cpu_ceiling_runs_after_the_single_instance_check():
+    """§11 / audit: a rejected second start must NOT touch systemd. main() used
+    to call apply_cpu_ceiling() before the pid check, so a browser restart that
+    did not confirm the old child died would spin up a transient scope (and pay
+    up to busctl's 10s timeout) only to exit 3 moments later."""
+    import tempfile
+    import subprocess
+    import app as _app
+
+    d = tempfile.mkdtemp(); sock = os.path.join(d, "m.sock")
+    other = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+
+    class Cfg:
+        socket_path = sock
+        cpu_max_cores = 1.0
+    calls = []
+    orig_ceiling, orig_cfg = _app.apply_cpu_ceiling, _app.load_config
+    _app.apply_cpu_ceiling = lambda cores: calls.append(cores)
+    _app.load_config = lambda: Cfg()
+    try:
+        with open(sock + ".pid", "w") as fh:
+            fh.write(str(other.pid))          # a live foreign owner
+        rc = _app.main()
+    finally:
+        _app.apply_cpu_ceiling, _app.load_config = orig_ceiling, orig_cfg
+        other.terminate(); other.wait()
+    record("29c", "apply_cpu_ceiling is skipped when a second start is rejected",
+           rc == 3 and calls == [], f"rc={rc} ceiling_calls={calls}")
+
+
 def t30_throttle_check_in_thread():
     """Structural, by inspection: compaction must run inside the engine loop."""
     import inspect

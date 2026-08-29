@@ -183,6 +183,22 @@ Claude/Anthropic attribution in commits. Server: hand-run from
    timeout guards it); or a second server start (PidLock should block it --
    confirm the lock is checked BEFORE `apply_cpu_ceiling`, it currently runs
    first in main()). Move `apply_cpu_ceiling` AFTER the PidLock check if not.
+   -- FIXED / hardened:
+   * ORDERING was wrong. `main()` called `apply_cpu_ceiling(cfg.cpu_max_cores)`
+     as its very first action, before the single-instance probe. A rejected
+     second start (browser restart that did not confirm the old child died)
+     therefore created a transient `malabr-cpu-<pid>.scope` -- and could block
+     up to busctl's 10s timeout -- before exiting 3 with nothing to do. Moved
+     the ceiling to AFTER the probe's early return. Regression: test 29c.
+   * SILENT PROPERTY DROP: busctl returning 0 is not proof the quota exists --
+     systemd creates the scope and drops the CPU property without error when the
+     cpu controller is not delegated to the user session. `apply_cpu_ceiling`
+     now reads back `cpu.max` on our own cgroup (from `/proc/self/cgroup`) and
+     logs "scope created but no cpu.max quota is in force" instead of a false
+     "applied". Best-effort, wrapped; environment-specific so no suite test.
+   * busctl HANG is already covered: `timeout=10` -> `SubprocessError` -> caught
+     -> logs "not applied" -> continues on the duty throttle. With the ordering
+     fix a rejected second start no longer pays that 10s.
 
 10. **Aggregate guard `guard < 3*len(live)+4` bound.** If it exhausts the
     iteration bound while still over `limit`, it silently returns and the next
