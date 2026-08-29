@@ -674,9 +674,18 @@
   // Toggling the checkbox does NOT force a re-read: the page is already in the
   // server's context, and only a real change to the page text (hashed in ask())
   // or a "New chat" re-attaches it.
-  $(".clear").addEventListener("click", () => {
+  $(".clear").addEventListener("click", async () => {
+    // §3: a real teardown, not a display clear. The display goes now (instant
+    // feedback); the server-side session + KV are ended over the meta channel
+    // and the note reports whether that was confirmed.
     log.innerHTML = ""; transcript = []; save(); pageHash = null;
-    note(log, "display cleared -- the model still holds this conversation", "note");
+    inFlight = null; sending = false;
+    let acked = false;
+    try { const r = await meta("new"); acked = !!(r && r.ok); } catch (e) {}
+    note(log, acked
+      ? "new chat — the previous conversation was released on the server"
+      : "display cleared, but the server did not confirm the teardown — the model may still hold this conversation",
+      acked ? "note" : "err");
   });
 
   restore();

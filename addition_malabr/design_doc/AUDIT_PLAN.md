@@ -168,6 +168,15 @@ Claude/Anthropic attribution in commits. Server: hand-run from
    §3 "full teardown, not a display clear"). Either wire a real teardown
    (needs a route or a control message -- `stop()` ends the turn but keeps the
    session; there is no "end session" verb) or change §3. Decide deliberately.
+   -- DECIDED: keep §3, wire the teardown. §3 is tied to RQ1 ("session death =
+   data death") and the engine already supports it (t03). The only gap was the
+   client, and the page-facing API is generate()/stop() only -- so, like the
+   model switcher, "New chat" now rides the meta channel: the panel sends
+   `\x00MALABR::new`, and `_handle_meta("new")` calls `engine.cancel()` +
+   `engine.wait_for_teardown([key])` before replying, so the panel's next
+   generate() is guaranteed a fresh session rather than the old one (and its
+   KV) reused. The panel clears the display immediately and the note now
+   reports whether the server confirmed the teardown. Regression: test 03c.
 
 9. **`apply_cpu_ceiling` partial failure.** busctl returns 0 but the scope has
    no cpu.max (systemd rejected the property silently); or busctl hangs (10s

@@ -147,6 +147,16 @@ def new_chat(ext_id, tab_id):
 
 JS side: clear that tab's `chrome.storage.session` entry, empty the panel.
 
+**Transport (implementation note):** the page-facing API is `generate()`/`stop()`
+only, and `stop()` ends the turn but keeps the session — there is no page-facing
+"end session" verb, and adding one is a Chromium rebuild. So "new chat" rides the
+same meta channel as the model switcher: the panel sends the sentinel prompt
+`\x00MALABR::new`, and `_handle_meta("new")` runs `engine.cancel(key)` followed by
+`engine.wait_for_teardown([key])` before it replies. The blocking wait is what
+makes this a real teardown and not a race: the panel's next `generate()` cannot
+be handed the condemned session back, because by the time the "new" reply lands
+the slot is already released.
+
 **Free test this gives us:** click "new chat," send a canary as the first
 message, ask for it back. If it ever appears, teardown is broken. Cheaper to
 run than closing/reopening tabs, and belongs in the canary suite (§9).

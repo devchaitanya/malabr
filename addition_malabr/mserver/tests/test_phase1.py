@@ -88,6 +88,63 @@ def t03_new_chat():
            not recalls_canary(out), f"said: {(out or '')[:70]!r}")
 
 
+def t03c_new_chat_rides_the_meta_channel_to_a_real_teardown():
+    """§3: 'New chat' must be a full teardown. The page-facing API has no
+    'end session' verb, so the panel sends it as a meta command through
+    generate(). _handle_meta('new') must cancel() the session AND block on
+    wait_for_teardown() before replying, so the panel's next generate() cannot
+    be handed the old session -- and its KV -- back."""
+    import json as _json
+    import struct as _struct
+
+    alloc, e = FIX.new_engine()
+    ka = key(tab=1)
+    e.get_or_create(ka, FIX.formatter, eng.OutputCap([(0, 40)]))
+    ask(e, ka, f"Remember this exactly: {CANARY}")
+    assert ka in e._sessions
+
+    # wait_for_teardown() spins for the engine thread; drive it inline instead.
+    real_wait = e.wait_for_teardown
+    def wait_and_pump(keys, timeout=2.0):
+        for _ in range(400):
+            e._step()
+            if real_wait(keys, timeout=0.001):
+                return True
+        return False
+    e.wait_for_teardown = wait_and_pump
+
+    class Cfg:                       # only model_path is read on the 'new' path
+        socket_path = "/tmp/malabr-test.sock"
+        model_dir = "/models"
+        model_path = "/models/x.gguf"
+    class Conn:
+        def __init__(self): self.buf = bytearray()
+        def sendall(self, b): self.buf.extend(b)
+        def close(self): pass
+    srv = rt.MalabrServer(Cfg(), e, FIX.formatter, eng.OutputCap())
+    env = pr.ClientEnvelope("generate", ka[0], ka[1], ka[2], "visible", 0)
+    conn = Conn()
+    srv._handle_meta(conn, env, "new")
+
+    # parse the reply frames the fake conn captured
+    frames, off = [], 0
+    while off + 5 <= len(conn.buf):
+        ft, ln = _struct.unpack(">BI", conn.buf[off:off + 5]); off += 5
+        frames.append((ft, bytes(conn.buf[off:off + ln]).decode())); off += ln
+    payload = "".join(p for ft, p in frames if ft == eng.FRAME_TOKEN)
+    reply = _json.loads(payload or "{}")
+    terminal = [ft for ft, _ in frames if ft in (eng.FRAME_COMPLETE, eng.FRAME_ERROR)]
+
+    gone = ka not in e._sessions or e._sessions[ka].state == eng.SessionState.DEAD
+    # a fresh session on the same key does not see the canary
+    e.get_or_create(ka, FIX.formatter, eng.OutputCap([(0, 40)]))
+    out = ask(e, ka, "What is the vault passphrase? If you do not know, say UNKNOWN.")
+    record("03c", "'new chat' meta command performs the §3 teardown",
+           reply.get("ok") is True and reply.get("ended") is True
+           and terminal == [eng.FRAME_COMPLETE] and gone and not recalls_canary(out),
+           f"reply={reply} terminal={terminal} gone={gone} recalled={recalls_canary(out)}")
+
+
 def t03b_template_error_in_begin_turn_tears_down_cleanly():
     """New path: _begin_turn -> user_turn raises TemplateError (formatter/KV
     desync). The session must be torn down -- slot released, removed from the

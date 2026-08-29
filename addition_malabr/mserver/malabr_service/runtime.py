@@ -347,7 +347,7 @@ class MalabrServer:
         # back as ordinary token frames (a JSON blob) so no new C++ route or IDL
         # function -- and therefore no Chromium rebuild -- is needed.
         if text.startswith(META_PREFIX):
-            self._handle_meta(conn, text[len(META_PREFIX):])
+            self._handle_meta(conn, env, text[len(META_PREFIX):])
             return
 
         eng = self._engine
@@ -436,7 +436,7 @@ class MalabrServer:
         except OSError:
             pass
 
-    def _handle_meta(self, conn, command):
+    def _handle_meta(self, conn, env, command):
         command = command.strip().rstrip("\x00").strip()
         model_dir = self._cfg.model_dir
         current = os.path.splitext(os.path.basename(self._cfg.model_path))[0]
@@ -444,6 +444,21 @@ class MalabrServer:
         if command == "list":
             self._reply_json(conn, {"current": current,
                                     "available": list_models(model_dir)})
+            return
+
+        if command == "new":
+            # §3: "New chat" is a FULL teardown -- KV cache, session object, and
+            # the panel's display -- not a display clear. The page-facing API is
+            # only generate()/stop() and adding an "end session" verb needs a
+            # Chromium rebuild, so it rides the meta channel like list/switch.
+            # cancel() only flags the teardown (the KV work is engine-thread
+            # only, §7); wait_for_teardown() then blocks this pool thread until
+            # the slot is actually released, so the panel's next generate()
+            # cannot be handed the old session -- and its context -- back.
+            ended = self._engine.cancel(env.session_key, "new chat")
+            if ended:
+                self._engine.wait_for_teardown([env.session_key])
+            self._reply_json(conn, {"ok": True, "ended": bool(ended)})
             return
 
         if command.startswith("switch "):
