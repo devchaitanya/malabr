@@ -241,6 +241,15 @@ Claude/Anthropic attribution in commits. Server: hand-run from
     default is a hardcoded 2048; if a test sets `n_ctx` such that
     `n_ctx//n_seq_max != 2048` the compaction-trigger math in that test is off.
     Low priority -- only test 40/54 touch it and they set `s.budget` explicitly.
+    -- FIXED. For the 4096/4 fixture the hardcoded 2048 put `needs_compaction`'s
+    trigger at ~1945 in a partitioned sequence that llama.cpp hard-caps at 1024
+    -- so an un-overridden non-shared session would hit the KV wall before
+    compaction fired. Harness default now mirrors production
+    (`config.n_ctx_per_session`): `n_ctx // n_seq_max` non-shared, `n_ctx // 2`
+    shared-KV. The explicit `s.budget = FIX.n_ctx // FIX.n_seq_max` lines in
+    t04/t09/t53/t54 are now redundant but harmless and left in place. Suite
+    unchanged (no test depended on the old 2048). Regression: test 40f pins the
+    harness engine's budget to the production formula.
 
 13. **Re-run the §12 suite under `MALABR_SHARED_KV=1`** (set it in harness or a
     second pass). The suite currently runs partitioned only; shared-KV changes
