@@ -1,136 +1,19 @@
-// MALABR Phase 1 chat panel.
-//
-// A CONTENT SCRIPT deliberately, not a popup or side panel: those have no real
-// tab_id and no meaningful visibility, so the browser could not derive the
-// identity the design depends on (phase1_design.md sections 2 and 5).
-// all_frames:false so one page is one session, not one per iframe (test 36).
+// MALABR Phase 1 chat panel. Rationale: implementation_notes.md, content.js
 
 (function () {
   if (window.top !== window) return;
   if (document.getElementById("malabr-root")) return;
 
-  // Section 8's input cap is budget - RESERVED_FOR_RESPONSE, i.e. ~1792 tokens
-  // for a 2048-token session share. An oversized prompt is REJECTED outright
-  // (compaction cannot help a single prompt that exceeds the whole budget), so
-  // the page text plus the wrapper plus the user's question plus the running
-  // conversation must all fit. At a worst-case ~3 chars/token that budget is
-  // ~5300 chars for the WHOLE prompt; 4000 for the page body leaves room for
-  // the wrapper, the question, and a few turns of history before compaction.
+  const CSS = STYLES();   // defined at the bottom of this file; hoisted as a function
+
+  // Page text is capped so prompt + page + history fit the session budget  [notes: content.js MAX_PAGE_CHARS]
   const MAX_PAGE_CHARS = 4000;
 
   const host = document.createElement("div");
   host.id = "malabr-root";
   const shadow = host.attachShadow({ mode: "closed" });
   shadow.innerHTML = `
-    <style>
-      :host { all: initial; }
-      * { box-sizing: border-box; }
-      .wrap { position: fixed; right: 20px; bottom: 20px; z-index: 2147483647;
-              font: 14px/1.6 ui-sans-serif, -apple-system, "Segoe UI", sans-serif; }
-
-      .pill { width: 46px; height: 46px; border-radius: 50%; border: 0; display: none;
-              background: #c96442; color: #fff; font-size: 19px; cursor: pointer;
-              box-shadow: 0 6px 20px rgba(0,0,0,.45); }
-      .wrap.min .pill { display: block; }
-      .wrap.min .box  { display: none; }
-
-      .box { width: 400px; height: 560px; max-height: 78vh; display: flex;
-             flex-direction: column; overflow: hidden; resize: both;
-             min-width: 320px; min-height: 260px;
-             background: #262624; color: #f5f4ef;
-             border: 1px solid #3d3d3a; border-radius: 14px;
-             box-shadow: 0 16px 48px rgba(0,0,0,.5); }
-
-      .hdr { display: flex; align-items: center; gap: 8px; padding: 10px 12px;
-             border-bottom: 1px solid #3d3d3a; background: #1f1e1d; }
-      .dot { width: 8px; height: 8px; border-radius: 50%; background: #c96442;
-             flex: none; }
-      .title { font-weight: 600; font-size: 13px; letter-spacing: .2px; flex: none; }
-      .origin { margin-left: auto; font-size: 11px; color: #8a8880;
-                overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
-                min-width: 0; }
-      /* Model picker on its own row -- in the header it crowded the origin and
-         the icons on a 400px panel. */
-      .modelbar { display: flex; align-items: center; gap: 7px; padding: 6px 12px;
-                  border-bottom: 1px solid #3d3d3a; background: #1f1e1d; }
-      .mlabel { font-size: 10px; text-transform: uppercase; letter-spacing: .5px;
-                color: #8a8880; flex: none; }
-      .model { flex: 1; min-width: 0; font-size: 11.5px; background: #262624;
-               color: #cfcec7; border: 1px solid #46453f; border-radius: 6px;
-               padding: 3px 6px; }
-      .model:disabled { opacity: .5; cursor: progress; }
-      .icon { border: 0; background: transparent; color: #a3a096; cursor: pointer;
-              font-size: 15px; line-height: 1; padding: 4px 7px; border-radius: 6px; }
-      .icon:hover { background: #34332f; color: #f5f4ef; }
-
-      .log { flex: 1; overflow-y: auto; padding: 16px 14px; scroll-behavior: smooth; }
-      .log::-webkit-scrollbar { width: 9px; }
-      .log::-webkit-scrollbar-thumb { background: #46453f; border-radius: 5px; }
-
-      .turn { margin-bottom: 18px; }
-      /* Column so the "page attached" chip sits ABOVE the bubble, not squished
-         beside it -- both right-aligned. */
-      .turn.you { display: flex; flex-direction: column; align-items: flex-end; }
-      .bubble { max-width: 86%; padding: 9px 13px; border-radius: 14px;
-                background: #37362f; white-space: pre-wrap; word-wrap: break-word; }
-      .turn.ai .body { word-wrap: break-word; }
-      .body p { margin: 0 0 8px; }
-      .body p:last-child { margin-bottom: 0; }
-      .body strong { font-weight: 650; color: #fdfcf8; }
-      .body em { font-style: italic; }
-      .body code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-                   font-size: 12px; background: #1c1b19; border: 1px solid #3d3d3a;
-                   border-radius: 4px; padding: 0 4px; }
-      .body pre { background: #1c1b19; border: 1px solid #3d3d3a; border-radius: 8px;
-                  padding: 9px 11px; overflow-x: auto; margin: 0 0 8px; }
-      .body pre code { background: none; border: 0; padding: 0; font-size: 12px;
-                       white-space: pre; }
-      .body h4 { font-size: 13px; font-weight: 650; color: #fdfcf8; margin: 10px 0 6px; }
-      .body ul, .body ol { margin: 0 0 8px; padding-left: 20px; }
-      .body li { margin: 2px 0; }
-      .body > *:first-child { margin-top: 0; }
-      .who { font-size: 11px; color: #8a8880; margin-bottom: 5px;
-             text-transform: uppercase; letter-spacing: .6px; }
-
-      /* Reasoning is collapsed by default. Suppressed at the prompt where the
-         model's template allows it, so this is a fallback for models that
-         cannot be told to stop thinking. */
-      details.think { margin: 0 0 8px; border-left: 2px solid #4a4942;
-                      padding-left: 9px; }
-      details.think > summary { cursor: pointer; color: #8a8880; font-size: 12px;
-                                list-style: none; user-select: none; }
-      details.think > summary::-webkit-details-marker { display: none; }
-      details.think > summary::before { content: "▸ "; }
-      details.think[open] > summary::before { content: "▾ "; }
-      details.think .inner { color: #a3a096; font-size: 12.5px; padding-top: 6px;
-                             white-space: pre-wrap; }
-
-      .meta { font-size: 11.5px; margin-top: 5px; }
-      .meta.err  { color: #e0806a; }
-      .meta.note { color: #8a8880; }
-      .chip { align-self: flex-end; max-width: 100%; font-size: 10.5px;
-              color: #a3a096; background: #34332f; border-radius: 5px;
-              padding: 2px 7px; margin-bottom: 5px; white-space: nowrap;
-              overflow: hidden; text-overflow: ellipsis; }
-      .caret::after { content: "▍"; animation: blink 1.1s steps(2) infinite; }
-      @keyframes blink { 50% { opacity: 0 } }
-
-      .composer { border-top: 1px solid #3d3d3a; padding: 9px; background: #1f1e1d; }
-      .tools { display: flex; align-items: center; gap: 8px; margin-bottom: 7px; }
-      .toggle { font-size: 11.5px; color: #a3a096; cursor: pointer; user-select: none;
-                display: flex; align-items: center; gap: 5px; }
-      .toggle input { accent-color: #c96442; margin: 0; }
-      .row { display: flex; gap: 7px; align-items: flex-end; }
-      textarea { flex: 1; resize: none; min-height: 40px; max-height: 130px;
-                 padding: 9px 11px; border-radius: 10px; font: inherit;
-                 background: #262624; color: #f5f4ef; border: 1px solid #46453f; }
-      textarea:focus { outline: none; border-color: #c96442; }
-      .act { width: 38px; height: 38px; flex: none; border: 0; border-radius: 9px;
-             background: #c96442; color: #fff; cursor: pointer; font-size: 15px;
-             display: flex; align-items: center; justify-content: center; }
-      .act.stop { background: #6b6a63; }
-      .act:disabled { opacity: .45; cursor: default; }
-    </style>
+    <style>${CSS}</style>
     <div class="wrap">
       <button class="pill" title="Open MALABR">&#9679;</button>
       <div class="box">
@@ -167,18 +50,11 @@
   $(".min").addEventListener("click", () => wrap.classList.add("min"));
   $(".pill").addEventListener("click", () => { wrap.classList.remove("min"); ta.focus(); });
 
-  // ---- transcript persistence (section 2) --------------------------------
-  // chrome.storage.session, NOT storage.local: session storage is memory-backed
-  // and dies with the browser, which is what section 4's "nothing durable"
-  // rule requires. storage.local would write conversations to disk.
+  // ---- transcript persistence (section 2) ------------------------...  [notes: content.js sessReady]
   const KEY = "malabr:" + location.origin;
   let transcript = [];
 
-  // chrome.storage.session is gated to TRUSTED_CONTEXTS by default, i.e. NOT
-  // content scripts. bg.js opens it with setAccessLevel; until that lands the
-  // namespace is simply absent here, so a content script's first restore() can
-  // race the service worker's cold start. sessReady() waits for the namespace
-  // to appear (bounded), then read/write work normally.
+  // chrome.storage.session is gated to TRUSTED_CONTEXTS by default, i.e  [notes: content.js sessReady]
   function sessReady(cb, tries) {
     tries = tries || 0;
     if (chrome.storage && chrome.storage.session) return cb(chrome.storage.session);
@@ -189,10 +65,7 @@
 
   function save() {
     sessReady((s) => {
-      // Last 40 turns only: chrome.storage.session has a ~10MB quota shared by
-      // the whole extension, and a turn can carry a page-sized reply. Older
-      // turns stop persisting across reloads; the server's KV still has them
-      // until compaction, so nothing the model knows is lost, only the display.
+      // Last 40 turns only  [notes: content.js restore]
       try { s.set({ [KEY]: transcript.slice(-40) }); } catch (e) {}
     });
   }
@@ -203,10 +76,7 @@
           if (chrome.runtime.lastError) return;
           const saved = o && o[KEY];
           if (!Array.isArray(saved) || !saved.length) return;
-          // The SERVER still holds this conversation after a reload: the
-          // session key is (extension, tab, origin) and none of those change.
-          // Without restoring the display the model would remember what the
-          // user cannot see -- the desync section 2 exists to prevent.
+          // The SERVER still holds this conversation after a reload  [notes: content.js esc]
           saved.forEach((m) => render(m.who, m.text, m.think, m.meta));
           transcript = saved;
           note(log.lastElementChild || log, "restored after reload", "note");
@@ -215,12 +85,7 @@
     });
   }
 
-  // ---- markdown (small, injection-safe) --------------------------------
-  // The model emits markdown heavily. This renders the common subset and
-  // NOTHING else: every character is HTML-escaped first, then a fixed set of
-  // patterns is turned into a fixed set of safe tags. No raw HTML from the
-  // model can survive -- it matters because page text (which the model may be
-  // repeating) is attacker-controlled when "include page text" is on.
+  // ---- markdown (small, injection-safe) --------------------------...  [notes: content.js esc]
   function esc(s) {
     return s.replace(/[&<>"]/g, (c) =>
       ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
@@ -325,9 +190,7 @@
     return;
   }
 
-  // ---- page text ----------------------------------------------------------
-  // Which page text (if any) the server already has for this session. Reset on
-  // "New chat" and on toggling the checkbox, so a deliberate re-check re-sends.
+  // ---- page text -------------------------------------------------...  [notes: content.js hashStr]
   let pageHash = null;
   function hashStr(s) {
     let h = 5381;
@@ -348,24 +211,12 @@
   const live = new Map();          // requestId -> render state
   let inFlight = null;             // requestId once generate()'s callback returns
   let sending = false;             // set SYNCHRONOUSLY the instant a send starts.
-                                   // inFlight is only assigned in generate()'s
-                                   // async callback, so without this a second
-                                   // Enter/paste in the same frame slips past the
-                                   // guard and opens a parallel generation --
-                                   // section 6b allows exactly one per session.
+                                   // inFlight is only assigned in generate()'s async callback, so wit...  [notes: content.js meta]
 
-  // How long to wait for generate()'s callback (which only hands back the
-  // request id -- tokens arrive separately on onToken) before assuming the
-  // extension message was dropped. Must exceed any legitimate round-trip: on a
-  // CPU-saturated box under a large prompt the old 10s could expire while the
-  // call was still healthy, dropping `sending` and letting a second Enter open
-  // the parallel generation the latch exists to stop. Shared with meta().
+  // How long to wait for generate()'s callback (which only hands bac...  [notes: content.js meta]
   const GENERATE_ACK_TIMEOUT_MS = 15000;
 
-  // ---- model switcher ---------------------------------------------------
-  // The page-facing API is only generate()/stop(), so a control command rides
-  // IN a generate() call: the prompt is the sentinel below, and the server
-  // answers with a JSON blob as ordinary token frames. No new IDL/C++ route.
+  // ---- model switcher --------------------------------------------...  [notes: content.js meta]
   const metaReqs = new Map();       // requestId -> { buf, resolve, reject }
   let switching = false;
 
@@ -503,9 +354,7 @@
   });
 
   function setBusy(busy) {
-    // A real stop needs malabr.stop(), which exists only once the browser is
-    // rebuilt with it. Feature-detected so the button never claims a capability
-    // the binary does not have.
+    // A real stop needs malabr.stop(), which exists only once the brow...  [notes: content.js chromeLM]
     const canStop = typeof chrome.malabr.stop === "function";
     act.classList.toggle("stop", busy && canStop);
     act.innerHTML = busy && canStop ? "&#9632;" : "&#10148;";
@@ -594,9 +443,7 @@
     const typed = ta.value.trim();
     if (!typed) return;
     if (/^\/bench\b/.test(typed)) {
-      // Same single-generation rule as a normal turn: a benchmark runs two
-      // full generations back to back, and an Enter meanwhile must not open a
-      // parallel one. Held via `sending` for the whole run.
+      // Same single-generation rule as a normal turn  [notes: content.js clear]
       if (inFlight || sending) return;
       sending = true;
       ta.value = ""; ta.style.height = "auto";
@@ -606,17 +453,12 @@
       return;
     }
     if (inFlight || sending) {
-      // A generation is already in flight for this tab. A second one must not
-      // start alongside it: if a real stop is available, treat this as "stop
-      // the current answer"; otherwise just swallow the keystroke.
+      // A generation is already in flight for this tab  [notes: content.js clear]
       if (inFlight && typeof chrome.malabr.stop === "function") chrome.malabr.stop();
       return;
     }
     sending = true;
-    // Safety net: if generate()'s callback never comes back (dropped extension
-    // message), don't leave the composer locked forever. On expiry also tear
-    // down this turn's half-open UI, so the next Enter starts genuinely fresh
-    // instead of racing a callback that might still be in flight.
+    // Safety net  [notes: content.js clear]
     const sendingGuard = setTimeout(() => {
       if (!sending) return;
       sending = false;
@@ -630,11 +472,7 @@
     let chip = null;
     if (usePage.checked) {
       const body = pageText();
-      // Send the page ONCE per session. The server keeps the conversation in
-      // its KV cache, so re-sending the whole page every turn just re-prefills
-      // it, burns the context budget, and makes the model re-read it. Only
-      // re-attach if the page text actually changed (SPA navigation, new tab
-      // content) or the conversation was cleared.
+      // Send the page ONCE per session  [notes: content.js clear]
       const h = body ? hashStr(body) : null;
       if (body && h !== pageHash) {
         prompt = `Here is the text of the page the user is viewing (${location.href}):\n\n`
@@ -681,13 +519,9 @@
   showThink.addEventListener("change", () => {
     shadow.querySelectorAll("details.think").forEach((d) => (d.open = showThink.checked));
   });
-  // Toggling the checkbox does NOT force a re-read: the page is already in the
-  // server's context, and only a real change to the page text (hashed in ask())
-  // or a "New chat" re-attaches it.
+  // Toggling the checkbox does NOT force a re-read  [notes: content.js clear]
   $(".clear").addEventListener("click", async () => {
-    // §3: a real teardown, not a display clear. The display goes now (instant
-    // feedback); the server-side session + KV are ended over the meta channel
-    // and the note reports whether that was confirmed.
+    // §3: a real teardown, not a display clear  [notes: content.js STYLES]
     log.innerHTML = ""; transcript = []; save(); pageHash = null;
     inFlight = null; sending = false;
     let acked = false;
@@ -699,10 +533,7 @@
   });
 
   restore();
-  // The server may still be loading its model when the panel appears (cold
-  // start, or MalabrManager just spawned it). A single failed list would leave
-  // the model picker empty for the life of the tab, so retry with backoff
-  // until it answers -- bounded, and only until the first success.
+  // The server may still be loading its model when the panel appears...  [notes: content.js STYLES]
   (async function primeModels(tries) {
     for (let i = 0; i < tries; i++) {
       if (await refreshModels()) return;
@@ -710,4 +541,117 @@
     }
   })(20);
   ta.focus();
+
+  // ---- styles (kept last so the logic above reads first) ----------------
+  function STYLES() {
+    return `
+      :host { all: initial; }
+      * { box-sizing: border-box; }
+      .wrap { position: fixed; right: 20px; bottom: 20px; z-index: 2147483647;
+              font: 14px/1.6 ui-sans-serif, -apple-system, "Segoe UI", sans-serif; }
+
+      .pill { width: 46px; height: 46px; border-radius: 50%; border: 0; display: none;
+              background: #c96442; color: #fff; font-size: 19px; cursor: pointer;
+              box-shadow: 0 6px 20px rgba(0,0,0,.45); }
+      .wrap.min .pill { display: block; }
+      .wrap.min .box  { display: none; }
+
+      .box { width: 400px; height: 560px; max-height: 78vh; display: flex;
+             flex-direction: column; overflow: hidden; resize: both;
+             min-width: 320px; min-height: 260px;
+             background: #262624; color: #f5f4ef;
+             border: 1px solid #3d3d3a; border-radius: 14px;
+             box-shadow: 0 16px 48px rgba(0,0,0,.5); }
+
+      .hdr { display: flex; align-items: center; gap: 8px; padding: 10px 12px;
+             border-bottom: 1px solid #3d3d3a; background: #1f1e1d; }
+      .dot { width: 8px; height: 8px; border-radius: 50%; background: #c96442;
+             flex: none; }
+      .title { font-weight: 600; font-size: 13px; letter-spacing: .2px; flex: none; }
+      .origin { margin-left: auto; font-size: 11px; color: #8a8880;
+                overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+                min-width: 0; }
+      /* Model picker on its own row -- in the header it crowded the origin and
+         the icons on a 400px panel. */
+      .modelbar { display: flex; align-items: center; gap: 7px; padding: 6px 12px;
+                  border-bottom: 1px solid #3d3d3a; background: #1f1e1d; }
+      .mlabel { font-size: 10px; text-transform: uppercase; letter-spacing: .5px;
+                color: #8a8880; flex: none; }
+      .model { flex: 1; min-width: 0; font-size: 11.5px; background: #262624;
+               color: #cfcec7; border: 1px solid #46453f; border-radius: 6px;
+               padding: 3px 6px; }
+      .model:disabled { opacity: .5; cursor: progress; }
+      .icon { border: 0; background: transparent; color: #a3a096; cursor: pointer;
+              font-size: 15px; line-height: 1; padding: 4px 7px; border-radius: 6px; }
+      .icon:hover { background: #34332f; color: #f5f4ef; }
+
+      .log { flex: 1; overflow-y: auto; padding: 16px 14px; scroll-behavior: smooth; }
+      .log::-webkit-scrollbar { width: 9px; }
+      .log::-webkit-scrollbar-thumb { background: #46453f; border-radius: 5px; }
+
+      .turn { margin-bottom: 18px; }
+      /* Column so the "page attached" chip sits ABOVE the bubble, not squished
+         beside it -- both right-aligned. */
+      .turn.you { display: flex; flex-direction: column; align-items: flex-end; }
+      .bubble { max-width: 86%; padding: 9px 13px; border-radius: 14px;
+                background: #37362f; white-space: pre-wrap; word-wrap: break-word; }
+      .turn.ai .body { word-wrap: break-word; }
+      .body p { margin: 0 0 8px; }
+      .body p:last-child { margin-bottom: 0; }
+      .body strong { font-weight: 650; color: #fdfcf8; }
+      .body em { font-style: italic; }
+      .body code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+                   font-size: 12px; background: #1c1b19; border: 1px solid #3d3d3a;
+                   border-radius: 4px; padding: 0 4px; }
+      .body pre { background: #1c1b19; border: 1px solid #3d3d3a; border-radius: 8px;
+                  padding: 9px 11px; overflow-x: auto; margin: 0 0 8px; }
+      .body pre code { background: none; border: 0; padding: 0; font-size: 12px;
+                       white-space: pre; }
+      .body h4 { font-size: 13px; font-weight: 650; color: #fdfcf8; margin: 10px 0 6px; }
+      .body ul, .body ol { margin: 0 0 8px; padding-left: 20px; }
+      .body li { margin: 2px 0; }
+      .body > *:first-child { margin-top: 0; }
+      .who { font-size: 11px; color: #8a8880; margin-bottom: 5px;
+             text-transform: uppercase; letter-spacing: .6px; }
+
+      /* Reasoning is collapsed by default. Suppressed at the prompt where the
+         model's template allows it, so this is a fallback for models that
+         cannot be told to stop thinking. */
+      details.think { margin: 0 0 8px; border-left: 2px solid #4a4942;
+                      padding-left: 9px; }
+      details.think > summary { cursor: pointer; color: #8a8880; font-size: 12px;
+                                list-style: none; user-select: none; }
+      details.think > summary::-webkit-details-marker { display: none; }
+      details.think > summary::before { content: "▸ "; }
+      details.think[open] > summary::before { content: "▾ "; }
+      details.think .inner { color: #a3a096; font-size: 12.5px; padding-top: 6px;
+                             white-space: pre-wrap; }
+
+      .meta { font-size: 11.5px; margin-top: 5px; }
+      .meta.err  { color: #e0806a; }
+      .meta.note { color: #8a8880; }
+      .chip { align-self: flex-end; max-width: 100%; font-size: 10.5px;
+              color: #a3a096; background: #34332f; border-radius: 5px;
+              padding: 2px 7px; margin-bottom: 5px; white-space: nowrap;
+              overflow: hidden; text-overflow: ellipsis; }
+      .caret::after { content: "▍"; animation: blink 1.1s steps(2) infinite; }
+      @keyframes blink { 50% { opacity: 0 } }
+
+      .composer { border-top: 1px solid #3d3d3a; padding: 9px; background: #1f1e1d; }
+      .tools { display: flex; align-items: center; gap: 8px; margin-bottom: 7px; }
+      .toggle { font-size: 11.5px; color: #a3a096; cursor: pointer; user-select: none;
+                display: flex; align-items: center; gap: 5px; }
+      .toggle input { accent-color: #c96442; margin: 0; }
+      .row { display: flex; gap: 7px; align-items: flex-end; }
+      textarea { flex: 1; resize: none; min-height: 40px; max-height: 130px;
+                 padding: 9px 11px; border-radius: 10px; font: inherit;
+                 background: #262624; color: #f5f4ef; border: 1px solid #46453f; }
+      textarea:focus { outline: none; border-color: #c96442; }
+      .act { width: 38px; height: 38px; flex: none; border: 0; border-radius: 9px;
+             background: #c96442; color: #fff; cursor: pointer; font-size: 15px;
+             display: flex; align-items: center; justify-content: center; }
+      .act.stop { background: #6b6a63; }
+      .act:disabled { opacity: .45; cursor: default; }
+    `;
+  }
 })();

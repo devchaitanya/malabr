@@ -1981,3 +1981,128 @@ read-only probe: a probe leaves the pidfile unclaimed through the
 and both pay for a model load and calibration before one is turned
 away at the socket. And it must precede apply_cpu_ceiling, or the
 rejected start still spins up a systemd scope it will never use.
+
+### content.js
+
+#### content.js (module)
+
+MALABR Phase 1 chat panel.
+
+#### content.js MAX_PAGE_CHARS
+
+A CONTENT SCRIPT deliberately, not a popup or side panel: those have no real
+tab_id and no meaningful visibility, so the browser could not derive the
+identity the design depends on (phase1_design.md sections 2 and 5).
+all_frames:false so one page is one session, not one per iframe (test 36).
+
+#### content.js min
+
+Section 8's input cap is budget - RESERVED_FOR_RESPONSE, i.e. ~1792 tokens
+for a 2048-token session share. An oversized prompt is REJECTED outright
+(compaction cannot help a single prompt that exceeds the whole budget), so
+the page text plus the wrapper plus the user's question plus the running
+conversation must all fit. At a worst-case ~3 chars/token that budget is
+~5300 chars for the WHOLE prompt; 4000 for the page body leaves room for
+the wrapper, the question, and a few turns of history before compaction.
+
+#### content.js sessReady
+
+---- transcript persistence (section 2) --------------------------------
+chrome.storage.session, NOT storage.local: session storage is memory-backed
+and dies with the browser, which is what section 4's "nothing durable"
+rule requires. storage.local would write conversations to disk.
+
+chrome.storage.session is gated to TRUSTED_CONTEXTS by default, i.e. NOT
+content scripts. bg.js opens it with setAccessLevel; until that lands the
+namespace is simply absent here, so a content script's first restore() can
+race the service worker's cold start. sessReady() waits for the namespace
+to appear (bounded), then read/write work normally.
+
+#### content.js restore
+
+Last 40 turns only: chrome.storage.session has a ~10MB quota shared by
+the whole extension, and a turn can carry a page-sized reply. Older
+turns stop persisting across reloads; the server's KV still has them
+until compaction, so nothing the model knows is lost, only the display.
+
+#### content.js esc
+
+The SERVER still holds this conversation after a reload: the
+session key is (extension, tab, origin) and none of those change.
+Without restoring the display the model would remember what the
+user cannot see -- the desync section 2 exists to prevent.
+
+---- markdown (small, injection-safe) --------------------------------
+The model emits markdown heavily. This renders the common subset and
+NOTHING else: every character is HTML-escaped first, then a fixed set of
+patterns is turned into a fixed set of safe tags. No raw HTML from the
+model can survive -- it matters because page text (which the model may be
+repeating) is attacker-controlled when "include page text" is on.
+
+#### content.js hashStr
+
+---- page text ----------------------------------------------------------
+Which page text (if any) the server already has for this session. Reset on
+"New chat" and on toggling the checkbox, so a deliberate re-check re-sends.
+
+#### content.js meta
+
+inFlight is only assigned in generate()'s
+async callback, so without this a second
+Enter/paste in the same frame slips past the
+guard and opens a parallel generation --
+section 6b allows exactly one per session.
+
+How long to wait for generate()'s callback (which only hands back the
+request id -- tokens arrive separately on onToken) before assuming the
+extension message was dropped. Must exceed any legitimate round-trip: on a
+CPU-saturated box under a large prompt the old 10s could expire while the
+call was still healthy, dropping `sending` and letting a second Enter open
+the parallel generation the latch exists to stop. Shared with meta().
+
+---- model switcher ---------------------------------------------------
+The page-facing API is only generate()/stop(), so a control command rides
+IN a generate() call: the prompt is the sentinel below, and the server
+answers with a JSON blob as ordinary token frames. No new IDL/C++ route.
+
+#### content.js chromeLM
+
+A real stop needs malabr.stop(), which exists only once the browser is
+rebuilt with it. Feature-detected so the button never claims a capability
+the binary does not have.
+
+#### content.js clear
+
+Same single-generation rule as a normal turn: a benchmark runs two
+full generations back to back, and an Enter meanwhile must not open a
+parallel one. Held via `sending` for the whole run.
+
+A generation is already in flight for this tab. A second one must not
+start alongside it: if a real stop is available, treat this as "stop
+the current answer"; otherwise just swallow the keystroke.
+
+Safety net: if generate()'s callback never comes back (dropped extension
+message), don't leave the composer locked forever. On expiry also tear
+down this turn's half-open UI, so the next Enter starts genuinely fresh
+instead of racing a callback that might still be in flight.
+
+Send the page ONCE per session. The server keeps the conversation in
+its KV cache, so re-sending the whole page every turn just re-prefills
+it, burns the context budget, and makes the model re-read it. Only
+re-attach if the page text actually changed (SPA navigation, new tab
+content) or the conversation was cleared.
+
+Toggling the checkbox does NOT force a re-read: the page is already in the
+server's context, and only a real change to the page text (hashed in ask())
+or a "New chat" re-attaches it.
+
+#### content.js STYLES
+
+§3: a real teardown, not a display clear. The display goes now (instant
+feedback); the server-side session + KV are ended over the meta channel
+and the note reports whether that was confirmed.
+
+The server may still be loading its model when the panel appears (cold
+start, or MalabrManager just spawned it). A single failed list would leave
+the model picker empty for the life of the tab, so retry with backoff
+until it answers -- bounded, and only until the first success.
