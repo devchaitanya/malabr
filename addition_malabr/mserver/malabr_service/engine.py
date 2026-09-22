@@ -1794,7 +1794,16 @@ def build_batch(sessions, cost_curve, foreground_tab_id,
 
     # Foreground first and UNCONDITIONALLY: the first one is admitted even if it
     # alone exceeds the budget, or a deep foreground session could never run.
-    for s in fg:
+    #
+    # Ordered by rounds_excluded, for the two-extensions-on-one-tab case where
+    # fg has two members. Without this the SAME one always took the
+    # unconditional pick, and if it alone blew the budget the other could never
+    # satisfy c <= budget -- and was never aged either, because the aging pass
+    # below only looked at bg and rounds_excluded was reset for every fg
+    # session whether it ran or not. Permanent starvation, the same class §9a's
+    # aging fixes for bg-vs-bg. Giving the most-passed-over fg session the
+    # unconditional pick makes the two alternate instead.
+    for s in sorted(fg, key=lambda s: -s.rounds_excluded):
         c = cost_curve.cost_ms_worst(s.pos)
         if not picks or c <= budget:
             picks.append(s); budget -= c; spent += c
@@ -1802,9 +1811,11 @@ def build_batch(sessions, cost_curve, foreground_tab_id,
     # AGING PASS -- before cheapest-first gets to pass over the same sessions
     # again. Without it a moderately expensive bg session loses to the same
     # cheaper ones every round forever: real starvation, merely moved from
-    # fg-vs-bg to bg-vs-bg.
+    # fg-vs-bg to bg-vs-bg. Drawn from every unpicked runnable session, so a
+    # passed-over foreground member gets the same escape hatch.
     picked = set(id(s) for s in picks)
-    aged = sorted([s for s in bg if s.rounds_excluded >= MAX_CONSECUTIVE_EXCLUSIONS],
+    aged = sorted([s for s in runnable
+                   if id(s) not in picked and s.rounds_excluded >= MAX_CONSECUTIVE_EXCLUSIONS],
                   key=lambda s: -s.rounds_excluded)
     for s in aged:
         c = cost_curve.cost_ms_worst(s.pos)
@@ -1826,17 +1837,17 @@ def build_batch(sessions, cost_curve, foreground_tab_id,
     # NORMAL FILL -- cheapest-first. Arrival order (FIFO) would let whichever
     # session asked first consume the whole budget alone, stranding several
     # cheap sessions that would collectively have fit.
-    remaining = sorted([s for s in bg if id(s) not in picked],
-                       key=lambda s: cost_curve.cost_ms_worst(s.pos))
-    for s in remaining:
-        c = cost_curve.cost_ms_worst(s.pos)
+    remaining = sorted(((cost_curve.cost_ms_worst(s.pos), s)
+                        for s in runnable if id(s) not in picked),
+                       key=lambda cs: cs[0])
+    for c, s in remaining:
         if c <= budget:
             picks.append(s); picked.add(id(s)); budget -= c; spent += c
 
-    for s in bg:
+    # Counted for foreground too: an fg member that lost this round must age
+    # like anyone else, or the alternation above never triggers.
+    for s in runnable:
         s.rounds_excluded = 0 if id(s) in picked else s.rounds_excluded + 1
-    for s in fg:
-        s.rounds_excluded = 0
 
     # -- §9b: prefill fills whatever budget is LEFT ------------------------
     # Decode is admitted first on purpose: a token owed to a session already
