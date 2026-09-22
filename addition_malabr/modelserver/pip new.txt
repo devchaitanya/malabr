@@ -1,4 +1,0 @@
-pip install quart hypercorn uvloop transformers torch
-
-Run -
-hypercorn -k uvloop --bind 0.0.0.0:5000 nserver:app
