@@ -626,6 +626,44 @@ def t29c_cpu_ceiling_runs_after_the_single_instance_check():
            rc == 3 and calls == [], f"rc={rc} ceiling_calls={calls}")
 
 
+def t29d_pid_lock_is_held_before_the_model_loads():
+    """Minute audit item 2: main() must ACQUIRE the pid lock (write the
+    pidfile) before apply_cpu_ceiling/build, not merely probe it. A read-only
+    probe leaves the file unclaimed through the ~2-minute cold build, so two
+    launches close together both pass and both pay for calibration."""
+    import tempfile
+    import app as _app
+
+    d = tempfile.mkdtemp(); sock = os.path.join(d, "m.sock")
+
+    class Cfg:
+        socket_path = sock
+        cpu_max_cores = 1.0
+    seen = {}
+    def fake_ceiling(cores):
+        # Snapshot the pidfile at the moment the first heavy step starts.
+        try:
+            with open(sock + ".pid") as fh:
+                seen["pid"] = int(fh.read().strip())
+        except (OSError, ValueError):
+            seen["pid"] = None
+        raise RuntimeError("stop here -- build() is not needed for this test")
+    orig_ceiling, orig_cfg = _app.apply_cpu_ceiling, _app.load_config
+    _app.apply_cpu_ceiling = fake_ceiling
+    _app.load_config = lambda: Cfg()
+    try:
+        try:
+            _app.main()
+        except RuntimeError:
+            pass
+        released = not os.path.exists(sock + ".pid")
+    finally:
+        _app.apply_cpu_ceiling, _app.load_config = orig_ceiling, orig_cfg
+    record("29d", "pid lock is written before the CPU ceiling and model load",
+           seen.get("pid") == os.getpid() and released,
+           f"pidfile_at_ceiling={seen.get('pid')} (want {os.getpid()}) released={released}")
+
+
 def t30_throttle_check_in_thread():
     """Structural, by inspection: compaction must run inside the engine loop."""
     import inspect
@@ -706,6 +744,39 @@ def t34_payload_bound():
     except pr.ProtocolError:
         rejected = True
     record(34, "oversized declared payload rejected BEFORE recv_full", rejected)
+
+
+def t34b_header_length_bound_before_recv():
+    """Minute audit item 1: the 4-byte header length is raw wire data. It must
+    be bounded BEFORE recv_full, exactly like payload_size, or a peer declaring
+    ~4GB parks a pool thread in recv() forever."""
+    import struct as _struct
+
+    class Conn:
+        def __init__(self):
+            self.head = _struct.pack(">I", pr.MAX_HEADER_LEN + 1)
+            self.asked = []
+            self.closed = False
+        def recv(self, n):
+            self.asked.append(n)
+            if self.asked == [4]:
+                return self.head
+            raise AssertionError("recv called for the oversized body")
+        def close(self): self.closed = True
+        def sendall(self, b): pass
+
+    class Cfg:
+        socket_path = "/tmp/malabr-test.sock"; model_dir = "/m"; model_path = "/m/x.gguf"
+    srv = rt.MalabrServer(Cfg(), _FakeEngine([]), FIX.formatter, eng.OutputCap())
+    conn = Conn()
+    body_read = False
+    try:
+        srv.handle_connection(conn)
+    except AssertionError:
+        body_read = True
+    record("34b", "oversized declared header length rejected BEFORE recv_full",
+           not body_read and conn.closed and conn.asked == [4],
+           f"recv calls={conn.asked} closed={conn.closed}")
 
 
 def t35_calibration_atomic_write():
@@ -1074,6 +1145,30 @@ def t55_aging_bound():
            within and limit_holds,
            f"max streak={worst} (bound {eng.MAX_CONSECUTIVE_EXCLUSIONS}); "
            f"under saturation={poor.rounds_excluded}")
+
+
+def t55b_two_foreground_sessions_on_one_tab_alternate():
+    """Minute audit item 4: two extensions on the SAME visible tab give fg two
+    members. The first used to take the unconditional pick every round; if it
+    alone blew the budget the other could never satisfy c <= budget, was never
+    aged (aging only looked at bg), and had rounds_excluded zeroed every round
+    regardless. Permanent starvation of a foreground session."""
+    class S:
+        def __init__(self, ext, pos):
+            self.key = (ext * 32, 1, "https://x.test"); self.pos = pos
+            self.state = eng.SessionState.GENERATING; self.cancelled = False
+            self.inbox_tokens = []; self.prefill_offset = 0
+            self.rounds_excluded = 0; self.prefill_stalls = 0
+    curve = eng.CostCurve(DECODE_CURVE, PREFILL_CURVE)
+    deep, shallow = S("a", 4000), S("b", 32)        # same tab, deep listed first
+    shallow_runs, worst_streak = 0, 0
+    for _ in range(40):
+        picks, _, _ = eng.build_batch([deep, shallow], curve, foreground_tab_id=1)
+        shallow_runs += shallow in picks
+        worst_streak = max(worst_streak, shallow.rounds_excluded)
+    record("55b", "a second foreground session on the same tab is not starved",
+           shallow_runs >= 10 and worst_streak <= eng.MAX_CONSECUTIVE_EXCLUSIONS,
+           f"shallow ran {shallow_runs}/40, worst exclusion streak={worst_streak}")
 
 
 def t56_five_tabs_one_foreground():

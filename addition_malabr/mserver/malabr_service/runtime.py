@@ -22,7 +22,7 @@ from .config import list_models, load_config, resolve_model
 # A prompt that begins with this is a command, never a turn.
 META_PREFIX = "\x00MALABR::"
 from .protocol import (
-    FRAME_COMPLETE, FRAME_ERROR, FRAME_TOKEN,
+    FRAME_COMPLETE, FRAME_ERROR, FRAME_TOKEN, MAX_HEADER_LEN,
     MSG_EXT_UNLOADED, MSG_FOREGROUND, MSG_LIVE_TABS, MSG_TAB_CLOSED,
     ProtocolError, ROUTE_CONTROL, ROUTE_GENERATE, ROUTE_STOP,
     encode_frame, read_control_message, recv_full, unpack_client_envelope,
@@ -63,6 +63,8 @@ class PidLock:
         self._acquired = False
 
     def acquire(self):
+        if self._acquired:
+            return                          # idempotent: main() acquires early
         existing = self._read()
         # A pidfile naming OUR OWN pid can only be our re-exec predecessor:
         # os.execv keeps the pid, and the model switcher relies on that. It
@@ -227,13 +229,17 @@ def eng_stop(engine, env):
 class MalabrServer:
     """UDS listener + request routing."""
 
-    def __init__(self, cfg, engine, formatter_factory, output_cap):
+    def __init__(self, cfg, engine, formatter_factory, output_cap, lock=None):
         self._cfg = cfg
         self._engine = engine
         self._formatter_factory = formatter_factory
         self._output_cap = output_cap
         self._control = ControlReader(engine)
-        self._lock = PidLock(cfg.socket_path + ".pid")
+        # app.main() acquires the pid lock BEFORE the model load so a doomed
+        # duplicate start exits in milliseconds instead of after ~2 minutes of
+        # calibration. It hands that lock in; start() then re-acquires as a
+        # no-op. A caller without one (tests) gets a fresh lock as before.
+        self._lock = lock or PidLock(cfg.socket_path + ".pid")
         self._server = None
         self._pool = None
         self._running = False
@@ -300,6 +306,14 @@ class MalabrServer:
             conn.close()
             return
         (header_len,) = struct.unpack(">I", head)
+        # BOUND BEFORE recv_full -- the same rule protocol.py applies to
+        # payload_size. header_len is a raw 4-byte value off the wire; without
+        # this a co-resident peer declares ~4GB and parks a pool thread in
+        # recv() forever. unpack_client_envelope re-checks the length, but only
+        # after the read has already happened.
+        if header_len > MAX_HEADER_LEN:
+            conn.close()
+            return
         header = recv_full(conn, header_len)
         if header is None:
             conn.close()
@@ -511,9 +525,9 @@ class MalabrServer:
 
 
 def run_server(config=None, engine=None, formatter_factory=None,
-               output_cap=None):
+               output_cap=None, lock=None):
     cfg = config or load_config()
-    server = MalabrServer(cfg, engine, formatter_factory, output_cap)
+    server = MalabrServer(cfg, engine, formatter_factory, output_cap, lock=lock)
     server.start()
 
     def shutdown(*_):
