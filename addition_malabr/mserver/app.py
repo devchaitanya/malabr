@@ -56,11 +56,14 @@ def apply_cpu_ceiling(cores):
         return
     usec_per_sec = int(cores * 1_000_000)
 
-    if "malabr-cpu" in open("/proc/self/cgroup").read():
-        return                      # already scoped (e.g. after a model-switch re-exec)
-
     pid = os.getpid()
     try:
+        # Inside the try: this function's contract is "any failure logs and
+        # continues unthrottled", and an unreadable /proc (a hardened or
+        # procfs-less environment) must not be the one exception that crashes
+        # startup instead.
+        if "malabr-cpu" in open("/proc/self/cgroup").read():
+            return                  # already scoped (e.g. after a model-switch re-exec)
         r = subprocess.run(
             ["busctl", "--user", "call", "org.freedesktop.systemd1",
              "/org/freedesktop/systemd1", "org.freedesktop.systemd1.Manager",
@@ -184,29 +187,27 @@ def main():
     cfg = load_config()
     quick = os.getenv("MALABR_QUICK_CALIBRATION") == "1"
     model = ctx = engine = None
+    lock = rt.PidLock(cfg.socket_path + ".pid")
     try:
-        # Refuse early and QUIETLY if another instance holds the socket. This
-        # is spawned by MalabrManager, so an unhandled traceback here is noise
-        # in the Chrome log for a condition that is expected (a browser restart
-        # that did not confirm the old child died). Exit 3 distinguishes it from
-        # a real crash. MUST come before apply_cpu_ceiling: otherwise a rejected
-        # second start still spins up a transient systemd scope (and can block
-        # up to busctl's 10s timeout) before finding out it has no work to do.
-        probe = rt.PidLock(cfg.socket_path + ".pid")
-        existing = probe._read()
-        if existing is not None and probe._alive(existing) and existing != os.getpid():
-            print(f"malabr: another server is already running (pid {existing}); "
-                  f"exiting", file=sys.stderr, flush=True)
-            return 3
+        # Take the single-instance lock FOR REAL, first thing. This is spawned
+        # by MalabrManager, so a duplicate start (a browser restart that did
+        # not confirm the old child died) is expected, and exit 3 keeps it out
+        # of the Chrome log as a crash. It must be a real acquire, not a
+        # read-only probe: a probe leaves the pidfile unclaimed through the
+        # ~2-minute cold build(), so two launches close together both pass it
+        # and both pay for a model load and calibration before one is turned
+        # away at the socket. And it must precede apply_cpu_ceiling, or the
+        # rejected start still spins up a systemd scope it will never use.
+        lock.acquire()
         apply_cpu_ceiling(cfg.cpu_max_cores)   # before anything heavy, calibration included
         model, ctx, engine, output_cap = build(cfg, quick_calibration=quick)
         engine.start()
         rt.run_server(config=cfg, engine=engine,
                       formatter_factory=lambda: eng.ChatFormatter(model, vocab_of(model)),
-                      output_cap=output_cap)
+                      output_cap=output_cap, lock=lock)
         return 0
     except rt.SingleInstanceError as exc:
-        print(f"malabr: {exc}", file=sys.stderr, flush=True)
+        print(f"malabr: {exc}; exiting", file=sys.stderr, flush=True)
         return 3
     finally:
         if engine is not None:
@@ -215,6 +216,7 @@ def main():
             C.llama_free(ctx)
         if model:
             C.llama_model_free(model)
+        lock.release()                          # no-op if never acquired
 
 
 def vocab_of(model):
