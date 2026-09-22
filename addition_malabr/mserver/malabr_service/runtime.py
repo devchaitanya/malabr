@@ -17,16 +17,16 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 
 from .config import list_models, load_config, resolve_model
-
-# Chat-panel control commands, tunnelled through generate() (see handle_generate).
-# A prompt that begins with this is a command, never a turn.
-META_PREFIX = "\x00MALABR::"
 from .protocol import (
     FRAME_COMPLETE, FRAME_ERROR, FRAME_TOKEN, MAX_HEADER_LEN,
     MSG_EXT_UNLOADED, MSG_FOREGROUND, MSG_LIVE_TABS, MSG_TAB_CLOSED,
     ProtocolError, ROUTE_CONTROL, ROUTE_GENERATE, ROUTE_STOP,
     encode_frame, read_control_message, recv_full, unpack_client_envelope,
 )
+
+# Chat-panel control commands, tunnelled through generate() (see handle_generate).
+# A prompt that begins with this is a command, never a turn.
+META_PREFIX = "\x00MALABR::"
 
 # Section 7: this pool is a WAITING ROOM, not compute. It must sit well above
 # n_seq_max or it becomes an invisible FIFO gate in front of the scheduler --

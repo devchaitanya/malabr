@@ -92,19 +92,25 @@ def _fill_to(ctx, vocab, seq, target_pos, chunk=256):
     return pos
 
 
-_SAFE_TOKEN = None
+# Keyed by the vocab handle, not a bare global: a token id is only meaningful
+# for the vocabulary that produced it. One process only ever calibrates one
+# model today (a model switch re-execs), but a bare cache would silently hand a
+# second model the FIRST model's filler token and corrupt its curves with no
+# error -- the kind of assumption that should be enforced, not remembered.
+_SAFE_TOKEN = {}
 
 
 def _safe_token(vocab):
-    """A single ordinary token to use as filler. Cached."""
-    global _SAFE_TOKEN
-    if _SAFE_TOKEN is None:
+    """A single ordinary token to use as filler. Cached per vocab."""
+    key = int(vocab) if not isinstance(vocab, int) else vocab
+    tok = _SAFE_TOKEN.get(key)
+    if tok is None:
         buf = (C.llama_token * 8)()
         n = C.llama_tokenize(vocab, b" the", 4, buf, 8, False, False)
         if n <= 0:
             raise CalibrationError("could not tokenize filler")
-        _SAFE_TOKEN = int(buf[0])
-    return _SAFE_TOKEN
+        tok = _SAFE_TOKEN[key] = int(buf[0])
+    return tok
 
 
 def _time_decode_tokens(ctx, vocab, seq, pos, n_tokens):
@@ -135,27 +141,30 @@ def phase_a_threads(model_path, candidates=None, probe_tokens=24, n_ctx=1024):
     if candidates is None:
         candidates = sorted({1, 2, 4, cores})
     results = {}
-    for n in candidates:
-        if n < 1:
-            continue
-        mp = C.llama_model_default_params(); mp.n_gpu_layers = 0
-        model = C.llama_model_load_from_file(model_path.encode(), mp)
-        if not model:
-            raise CalibrationError(f"could not load model at {model_path}")
-        try:
+    # n_threads is a CONTEXT parameter, so the model -- the expensive part, a
+    # full GGUF load -- is loaded once and only the context is rebuilt per
+    # candidate. Reloading the model each time did the same work 3-4x over.
+    mp = C.llama_model_default_params(); mp.n_gpu_layers = 0
+    model = C.llama_model_load_from_file(model_path.encode(), mp)
+    if not model:
+        raise CalibrationError(f"could not load model at {model_path}")
+    try:
+        vocab = C.llama_model_get_vocab(model)
+        for n in candidates:
+            if n < 1:
+                continue
             cp = C.llama_context_default_params()
             cp.n_ctx, cp.n_seq_max, cp.n_batch, cp.n_threads = n_ctx, 1, 512, n
             ctx = C.llama_init_from_model(model, cp)
             if not ctx:
                 raise CalibrationError("context creation failed")
             try:
-                vocab = C.llama_model_get_vocab(model)
                 _fill_to(ctx, vocab, 0, 32)
                 results[n] = _time_decode_tokens(ctx, vocab, 0, 32, probe_tokens)
             finally:
                 C.llama_free(ctx)
-        finally:
-            C.llama_model_free(model)
+    finally:
+        C.llama_model_free(model)
     if not results:
         raise CalibrationError("no thread candidates measured")
     best = max(results, key=results.get)

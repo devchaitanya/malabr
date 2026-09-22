@@ -5,15 +5,17 @@ Launched by MalabrManager as `python3 addition_malabr/mserver/app.py`
 (chrome/browser/malabr_manager.cc:36).
 
 Startup order matters and is not arbitrary:
-  0. config, then the single-instance check, THEN the CPU ceiling -- a rejected
-     second start must not create a systemd scope it will never use
-  1. config      -- sizing computed from THIS machine, not baked in
-  2. model+ctx   -- one context, created once, owned by the engine thread
-  3. calibration -- measured or loaded from disk; feeds the scheduler
-  4. engine      -- started before the socket exists, so the first request
-                    never races an engine that is not running yet
-  5. socket      -- last, because accepting a connection we cannot serve is
-                    worse than making the browser retry its connect
+  1. config       -- sizing computed from THIS machine, not baked in
+  2. pid lock     -- acquired for real, first, so a duplicate start exits in
+                     milliseconds instead of after a full model load
+  3. CPU ceiling  -- after the lock, so a rejected start never creates a
+                     systemd scope it will not use; before anything heavy
+  4. model+ctx    -- one context, created once, owned by the engine thread
+  5. calibration  -- measured or loaded from disk; feeds the scheduler
+  6. engine       -- started before the socket exists, so the first request
+                     never races an engine that is not running yet
+  7. socket       -- last, because accepting a connection we cannot serve is
+                     worse than making the browser retry its connect
 """
 
 import os

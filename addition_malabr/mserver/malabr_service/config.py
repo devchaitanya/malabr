@@ -140,6 +140,11 @@ def compute_cpu_max_cores(n_threads=None):
     So: half the logical CPUs, but never below n_threads + 1 so it cannot
     throttle a normal decode. MALABR_CPU_MAX overrides ("N" cores, "N%", or
     "0"/"off" to disable).
+
+    NOTE the two percent conventions in this module are different on purpose:
+      MALABR_CPU_MAX=N%  -> N percent of ONE core (cpulimit's convention;
+                            "150%" = 1.5 cores, machine-size-independent)
+      QUOTA_PCT / MALABR_QUOTA_PCT -> percent of ALL physical cores
     """
     logical = os.cpu_count() or 2
     nt = n_threads if n_threads is not None else compute_n_threads()
@@ -201,7 +206,7 @@ def list_models(model_dir):
     of these and the server re-execs with MALABR_MODEL_PATH pointed at it.
     """
     try:
-        names = sorted(f[:-5] for f in os.listdir(model_dir)
+        names = sorted(os.path.splitext(f)[0] for f in os.listdir(model_dir)
                        if f.endswith(".gguf"))
     except OSError:
         names = []
@@ -236,8 +241,14 @@ def load_config(base_dir=None):
         model_bytes = os.path.getsize(model_path)
     except OSError:
         model_bytes = 0
-    n_ctx = ((int(env_ctx) // n_seq_max) * n_seq_max if env_ctx
-             else compute_n_ctx(n_seq_max, model_bytes=model_bytes))
+    if env_ctx:
+        # An explicit value may exceed MAX_N_CTX on purpose (see the constant),
+        # but it is still rounded down to a multiple of n_seq_max -- and a typo
+        # below n_seq_max would round to 0 and fail deep inside llama.cpp with
+        # nothing pointing back here. Floor it at one whole slot per sequence.
+        n_ctx = max(n_seq_max, (int(env_ctx) // n_seq_max) * n_seq_max)
+    else:
+        n_ctx = compute_n_ctx(n_seq_max, model_bytes=model_bytes)
 
     n_threads = int(os.getenv("MALABR_N_THREADS", compute_n_threads()))
     cpu_max_env = (os.getenv("MALABR_CPU_MAX") or "").strip().lower()

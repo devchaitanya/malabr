@@ -7,13 +7,19 @@ Built in the order the design mandates (most safety-critical first):
   4. compaction (8)
   5. scheduler (9a/9b)
 
-Only step 1 is present so far.
+All five are present, in that order, in this file.
 """
 
+import queue
 import sys
 import threading
+import time
 
 import llama_cpp.llama_cpp as C
+
+# Wire frame types are protocol.py's contract with the C++ side; the engine
+# only tags outbox entries with them, but it must use the SAME values.
+from .protocol import FRAME_COMPLETE, FRAME_ERROR, FRAME_TOKEN
 
 
 class SlotWipeError(RuntimeError):
@@ -581,16 +587,8 @@ class OutputCap:
 # Sections 6 / 6b / 7 -- session state and the single-threaded engine loop
 # ---------------------------------------------------------------------------
 
-import queue
-import time
-
-
-# Response frame types on the wire (section 10a). Exactly one TERMINAL frame
-# (COMPLETE or ERROR) ends every request -- see terminate() for why that is
-# unconditional rather than best-effort.
-FRAME_TOKEN = 0
-FRAME_COMPLETE = 1
-FRAME_ERROR = 2
+# Exactly one TERMINAL frame (COMPLETE or ERROR) ends every request -- see
+# terminate() for why that is unconditional rather than best-effort.
 
 
 class SessionState:
