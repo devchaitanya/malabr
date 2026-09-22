@@ -7,6 +7,11 @@ design docs -- looking for narrow robustness gaps, DRY/hygiene issues, and
 documentation-accuracy nits. Nothing here is suite-breaking; each item below is
 independently fixable and independently skippable.
 
+## STATUS: complete -- all 16 fixed (5412550..067defe), suite 57 -> 60
+
+Items 1, 2, 4 have regression tests (34b, 29d, 55b), each shown to fail on
+the pre-fix code. Suite green in both partitioned and MALABR_TEST_SHARED_KV=1.
+
 ## Method
 
 Read every production file start to end (not grep-driven), cross-checked
