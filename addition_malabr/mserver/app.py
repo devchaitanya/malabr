@@ -1,21 +1,7 @@
 #!/usr/bin/env python3
 """MALABR inference server entry point.
 
-Launched by MalabrManager as `python3 addition_malabr/mserver/app.py`
-(chrome/browser/malabr_manager.cc:36).
-
-Startup order matters and is not arbitrary:
-  1. config       -- sizing computed from THIS machine, not baked in
-  2. pid lock     -- acquired for real, first, so a duplicate start exits in
-                     milliseconds instead of after a full model load
-  3. CPU ceiling  -- after the lock, so a rejected start never creates a
-                     systemd scope it will not use; before anything heavy
-  4. model+ctx    -- one context, created once, owned by the engine thread
-  5. calibration  -- measured or loaded from disk; feeds the scheduler
-  6. engine       -- started before the socket exists, so the first request
-                     never races an engine that is not running yet
-  7. socket       -- last, because accepting a connection we cannot serve is
-                     worse than making the browser retry its connect
+Rationale: implementation_notes.md, app
 """
 
 import os
@@ -36,23 +22,7 @@ def apply_cpu_ceiling(cores):
     """HARD CPU cap (§11): move THIS process into a transient systemd scope with
     a cpu.max quota, kernel-enforced. `cores` is a float core count; <=0 = off.
 
-    A pure backstop -- the default (config.compute_cpu_max_cores) is half the
-    logical CPUs and always above n_threads, so it never bites normal
-    operation. It exists only so a bug or a pathological model cannot take the
-    whole machine; MALABR_CPU_DUTY is the smooth throttle that sets where usage
-    actually sits.
-
-    Why a self-move via busctl and not `systemd-run --scope python app.py`: that
-    leaves systemd-run as the parent and python as a child IN the scope, and
-    MalabrManager's Terminate(pid) on the parent does NOT propagate to python
-    (tested). Moving our OWN pid into the scope keeps the pid MalabrManager
-    tracks, has no intermediary to leak, and the empty scope is GC'd when we
-    exit. cpu is not delegated to our starting scope, so writing cpu.max
-    directly is impossible; systemd (the cgroup manager) enables the controller
-    when a CPU property is set on the new scope.
-
-    Best-effort: any failure (no busctl, not under a user systemd, denied) logs
-    and continues unthrottled -- the duty throttle still applies.
+    Rationale: implementation_notes.md, app.apply_cpu_ceiling
     """
     if not cores or cores <= 0:
         return
@@ -60,10 +30,7 @@ def apply_cpu_ceiling(cores):
 
     pid = os.getpid()
     try:
-        # Inside the try: this function's contract is "any failure logs and
-        # continues unthrottled", and an unreadable /proc (a hardened or
-        # procfs-less environment) must not be the one exception that crashes
-        # startup instead.
+        # Inside the try  [notes: app.apply_cpu_ceiling]
         if "malabr-cpu" in open("/proc/self/cgroup").read():
             return                  # already scoped (e.g. after a model-switch re-exec)
         r = subprocess.run(
@@ -83,10 +50,7 @@ def apply_cpu_ceiling(cores):
             print(f"malabr: CPU ceiling {cores:g} cores applied "
                   f"(cpu.max quota {usec_per_sec}us/s)", file=sys.stderr, flush=True)
         else:
-            # busctl returned 0 but there is no cpu.max quota on our cgroup.
-            # systemd does this silently when the cpu controller is not
-            # delegated to the user session -- the scope exists, the ceiling
-            # does not. Say so rather than log a false success.
+            # busctl returned 0 but there is no cpu.max quota on our cgroup  [notes: app.apply_cpu_ceiling]
             print("malabr: CPU ceiling scope created but no cpu.max quota is in "
                   "force -- running unthrottled (the duty throttle still applies)",
                   file=sys.stderr, flush=True)
@@ -97,10 +61,7 @@ def apply_cpu_ceiling(cores):
 def _cpu_max_quota_active():
     """Read back the effective cpu.max after StartTransientUnit succeeds.
 
-    A zero return code from busctl is not proof the quota exists: systemd will
-    create the scope and drop the CPU property without error when the cpu
-    controller is not delegated to the user session. The move into the new
-    scope can lag the call slightly, so retry briefly.
+    Rationale: implementation_notes.md, app._cpu_max_quota_active
     """
     import time as _t
     for _ in range(15):
@@ -135,9 +96,7 @@ def build(cfg, quick_calibration=False):
     # the context is created once with that value.
     result, measured = cal.load_or_run(cfg, eng.MIN_CAP, eng.ABSOLUTE_CEILING,
                                        quick=quick_calibration)
-    # An EXPLICIT MALABR_N_THREADS must win over the cached calibration's pick --
-    # otherwise the env var is silently a no-op whenever calibration.json exists,
-    # which is almost always.
+    # An EXPLICIT MALABR_N_THREADS must win over the cached calibratio...  [notes: app.build]
     if os.getenv("MALABR_N_THREADS"):
         n_threads = cfg.n_threads
     else:
@@ -150,9 +109,7 @@ def build(cfg, quick_calibration=False):
     cp.n_threads = n_threads
     cp.n_threads_batch = n_threads
     if cfg.shared_kv and hasattr(cp, "kv_unified"):
-        # One shared pool of n_ctx cells instead of n_seq_max hard slices, so a
-        # session can grow past n_ctx/n_seq_max. The engine's aggregate guard is
-        # then what keeps the total within n_ctx.
+        # One shared pool of n_ctx cells instead of n_seq_max hard slices,...  [notes: app.build]
         cp.kv_unified = True
     ctx = C.llama_init_from_model(model, cp)
     if not ctx:
@@ -191,15 +148,7 @@ def main():
     model = ctx = engine = None
     lock = rt.PidLock(cfg.socket_path + ".pid")
     try:
-        # Take the single-instance lock FOR REAL, first thing. This is spawned
-        # by MalabrManager, so a duplicate start (a browser restart that did
-        # not confirm the old child died) is expected, and exit 3 keeps it out
-        # of the Chrome log as a crash. It must be a real acquire, not a
-        # read-only probe: a probe leaves the pidfile unclaimed through the
-        # ~2-minute cold build(), so two launches close together both pass it
-        # and both pay for a model load and calibration before one is turned
-        # away at the socket. And it must precede apply_cpu_ceiling, or the
-        # rejected start still spins up a systemd scope it will never use.
+        # Take the single-instance lock FOR REAL, first thing  [notes: app.main]
         lock.acquire()
         apply_cpu_ceiling(cfg.cpu_max_cores)   # before anything heavy, calibration included
         model, ctx, engine, output_cap = build(cfg, quick_calibration=quick)

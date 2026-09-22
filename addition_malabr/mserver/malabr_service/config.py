@@ -1,11 +1,6 @@
 """Runtime configuration -- see design_doc/phase1_design.md section 11.
 
-Sizing is COMPUTED AT STARTUP from detected hardware, not hardcoded. The
-inherited config hardcoded n_ctx=4096, which at n_seq_max=8 gives 512 tokens
-per session -- roughly 6-8 short chat turns before compaction fires on EVERY
-conversation. That tests "does compaction work at all" rather than "does the
-policy correctly decide whose context to shrink under contention", which is
-the actual research question.
+Rationale: implementation_notes.md, config
 """
 
 import os
@@ -16,23 +11,7 @@ from dataclasses import dataclass, field
 # Used to turn an available-RAM figure into a context size.
 BYTES_PER_TOKEN = 107 * 1024
 
-# Fraction of USABLE RAM the KV pool may claim. The pool is a STOCK, not a
-# flow: n_ctx is allocated once as a single fixed block at context creation and
-# there is no runtime path by which it can grow. RSS was measured flat (~1139MB)
-# whether 1 or 8 sessions were resident, which is why no cgroup memory ceiling
-# is needed on top -- the allocation already cannot exceed itself.
-#
-# SECTION 11 SAYS 0.8 OF MemAvailable. That is measurably wrong here and the
-# number is not a rounding difference: on this machine it yields 75,340 tokens
-# = 7.7 GB of KV, against the 16,384 (1.7 GB) section 7 states outright -- 4.6x
-# apart. Three reasons the formula overshoots:
-#   1. MemAvailable counts reclaimable page cache as free. True for transient
-#      allocations, false for a PERMANENT reservation. Here MemAvailable is
-#      ~9 GB of which almost all is cache, and swap is already full.
-#   2. It never subtracts the model weights, which are also resident.
-#   3. It leaves nothing for the browser -- and protecting the browser from the
-#      inference engine is the entire point of the design.
-# So: a smaller fraction, an explicit browser reserve, and the model subtracted.
+# Fraction of USABLE RAM the KV pool may claim  [notes: config.(module)]
 RAM_FRACTION_FOR_KV = 0.5
 
 # Never hand the KV pool memory the browser will need. Chromium with a handful
@@ -47,15 +26,9 @@ QUOTA_PCT = 80
 # less context per tab, whatever n_ctx turns out to be.
 DEFAULT_N_SEQ_MAX = 8
 
-# Floor and ceiling on the computed context size. The floor keeps a small
-# machine from computing a context so tight that compaction is permanent; the
-# ceiling stops a large machine from reserving absurd amounts of RAM for a
-# feature the user may never use.
+# Floor and ceiling on the computed context size  [notes: config.(module)]
 MIN_N_CTX = 4096
-# Section 7 states n_ctx = 16384 outright. Used as the default ceiling so the
-# computed value agrees with the document on reference hardware instead of
-# exceeding it by 4x; raise it deliberately via MALABR_N_CTX on a machine with
-# real headroom.
+# Section 7 states n_ctx = 16384 outright  [notes: config.(module)]
 MAX_N_CTX = 16384
 
 
@@ -119,10 +92,7 @@ def compute_n_ctx(n_seq_max=DEFAULT_N_SEQ_MAX, available_bytes=None,
 def compute_n_threads(physical_cores=None):
     """Derived from the SAME quota as the cgroup limit, deliberately.
 
-    Setting one without the other is the nonlinear-loss regime measured in
-    section 11: squeezing more threads than the quota allows forces the kernel
-    to preempt and context-switch them inside a shrunk slice -- pure overhead,
-    no extra work done.
+    Rationale: implementation_notes.md, config.compute_n_threads
     """
     cores = physical_cores if physical_cores is not None else detect_physical_cores()
     return max(1, round(cores * QUOTA_PCT / 100))
@@ -137,14 +107,7 @@ def compute_cpu_max_cores(n_threads=None):
     the duty cycle. This just stops a bug or a pathological model from taking
     the whole machine.
 
-    So: half the logical CPUs, but never below n_threads + 1 so it cannot
-    throttle a normal decode. MALABR_CPU_MAX overrides ("N" cores, "N%", or
-    "0"/"off" to disable).
-
-    NOTE the two percent conventions in this module are different on purpose:
-      MALABR_CPU_MAX=N%  -> N percent of ONE core (cpulimit's convention;
-                            "150%" = 1.5 cores, machine-size-independent)
-      QUOTA_PCT / MALABR_QUOTA_PCT -> percent of ALL physical cores
+    Rationale: implementation_notes.md, config.compute_cpu_max_cores
     """
     logical = os.cpu_count() or 2
     nt = n_threads if n_threads is not None else compute_n_threads()
@@ -167,31 +130,21 @@ class ServerConfig:
 
     client_pool_workers: int
 
-    # Shared-KV mode (MALABR_SHARED_KV=1). Off: the KV cache is pre-partitioned
-    # into n_seq_max equal hard slices and a session cannot exceed n_ctx/n_seq_max
-    # (llama.cpp enforces this). On: kv_unified=true, one shared pool of n_ctx
-    # cells, each session gets a LARGER soft cap (n_ctx // shared_kv_soft_div,
-    # default n_ctx/2) and compaction is driven by AGGREGATE pressure -- so 1-2
-    # tabs get a big budget and many tabs degrade to roughly fair share.
+    # Shared-KV mode (MALABR_SHARED_KV=1)  [notes: config.ServerConfig]
     shared_kv: bool = False
     shared_kv_soft_div: int = 2
 
-    # Cooperative CPU throttle (MALABR_CPU_DUTY, 0<d<=1). The engine sleeps
-    # proportionally after each round, so average CPU lands near n_threads * d
-    # -- smoothly, and with no cgroup / launch-path plumbing. 1.0 = flat out.
+    # Cooperative CPU throttle (MALABR_CPU_DUTY, 0<d<=1)  [notes: config.ServerConfig]
     cpu_duty: float = 1.0
 
-    # HARD CPU ceiling in cores (MALABR_CPU_MAX). 0 = disabled. Default computed
-    # by compute_cpu_max_cores() -- half the logical CPUs, never below
-    # n_threads+1, so it is a runaway backstop, not a normal-operation limit.
+    # HARD CPU ceiling in cores (MALABR_CPU_MAX)  [notes: config.ServerConfig]
     cpu_max_cores: float = 0.0
 
     @property
     def n_ctx_per_session(self):
         """The per-session budget section 8's compaction trigger measures against.
 
-        Shared-KV: a SOFT cap (n_ctx/2 by default) -- the aggregate cap does the
-        real bounding. Partitioned: the HARD slice llama.cpp enforces.
+        Rationale: implementation_notes.md, config.ServerConfig.n_ctx_per_session
         """
         if self.shared_kv:
             return max(self.n_ctx // self.n_seq_max,
@@ -202,8 +155,7 @@ class ServerConfig:
 def list_models(model_dir):
     """Every *.gguf in the model directory, by bare name (no extension).
 
-    The chat panel's model switcher offers exactly this set; a switch names one
-    of these and the server re-execs with MALABR_MODEL_PATH pointed at it.
+    Rationale: implementation_notes.md, config.list_models
     """
     try:
         names = sorted(os.path.splitext(f)[0] for f in os.listdir(model_dir)
@@ -216,8 +168,7 @@ def list_models(model_dir):
 def resolve_model(model_dir, name):
     """Map a bare model name from list_models() back to a full path.
 
-    Returns None if the name is not one of the directory's .gguf files -- the
-    switcher must never be able to make the server exec an arbitrary path.
+    Rationale: implementation_notes.md, config.resolve_model
     """
     if name not in list_models(model_dir):
         return None
@@ -225,10 +176,7 @@ def resolve_model(model_dir, name):
 
 
 def load_config(base_dir=None):
-    # root is the mserver/ package dir; models live one level up beside it, in
-    # addition_malabr/models. Deriving model_dir from `root` put it in
-    # mserver/models, where nothing is -- calibration fell straight through to
-    # its Phase E fallback and reported a conservative curve as if measured.
+    # root is the mserver/ package dir  [notes: config.load_config]
     root = base_dir or os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     n_seq_max = int(os.getenv("MALABR_N_SEQ_MAX", DEFAULT_N_SEQ_MAX))
 
@@ -242,10 +190,7 @@ def load_config(base_dir=None):
     except OSError:
         model_bytes = 0
     if env_ctx:
-        # An explicit value may exceed MAX_N_CTX on purpose (see the constant),
-        # but it is still rounded down to a multiple of n_seq_max -- and a typo
-        # below n_seq_max would round to 0 and fail deep inside llama.cpp with
-        # nothing pointing back here. Floor it at one whole slot per sequence.
+        # An explicit value may exceed MAX_N_CTX on purpose (see the const...  [notes: config.load_config]
         n_ctx = max(n_seq_max, (int(env_ctx) // n_seq_max) * n_seq_max)
     else:
         n_ctx = compute_n_ctx(n_seq_max, model_bytes=model_bytes)
@@ -266,9 +211,7 @@ def load_config(base_dir=None):
         base_dir=root,
         model_dir=model_dir,
         model_path=model_path,
-        # Section 4's ONE stated exception to "nothing durable": calibration
-        # data is written to disk on purpose, so a cold start does not have to
-        # re-measure the machine every time.
+        # Section 4's ONE stated exception to "nothing durable"  [notes: config.load_config]
         calibration_path=os.getenv("MALABR_CALIBRATION_PATH",
                                    os.path.join(root, "calibration.json")),
         n_ctx=n_ctx,

@@ -1,6 +1,7 @@
 """Per-session state, output cap and turn bookkeeping -- sections 6, 6b, 8.
 
-See design_doc/implementation_notes.md, 'Code rationale: session'."""
+Rationale: implementation_notes.md, session
+"""
 
 import queue
 
@@ -19,21 +20,11 @@ MAX_OUTBOX_TOKENS = 2 * ABSOLUTE_CEILING
 class OutputCap:
     """Position-aware cap on tokens per response (section 8's context-growth fix).
 
-    A FLAT cap is wrong, and this is the one number the measurements most
-    directly contradict: decode runs at 48.3 tok/s at position 64 but 5.2 tok/s
-    at position 6000. A flat 512-token cap therefore costs ~11s early in a
-    conversation and ~98s deep into one -- the same number meaning wildly
-    different wall-clock time.
-
-    Calibration (Phase D) hands over a FINISHED table; the engine never derives
-    caps from raw curve data at runtime (section 12 test 31).
+    Rationale: implementation_notes.md, session.OutputCap
     """
 
     def __init__(self, table=None):
-        # table: sorted [(position, cap)]. None => no calibration data yet, so
-        # fall back to the floor rather than guessing high. Being too
-        # conservative truncates a reply; being too generous blows the latency
-        # budget the cap exists to enforce.
+        # table: sorted [(position, cap)]  [notes: session.OutputCap.__init__]
         self._table = sorted(table) if table else None
 
     def for_position(self, pos):
@@ -50,9 +41,7 @@ class OutputCap:
         return max(MIN_CAP, min(int(cap), ABSOLUTE_CEILING))
 
 
-# ---------------------------------------------------------------------------
-# Sections 6 / 6b / 7 -- session state and the single-threaded engine loop
-# ---------------------------------------------------------------------------
+# ----------------------------------------------------------------...  [notes: session.(module)]
 
 # Exactly one TERMINAL frame (COMPLETE or ERROR) ends every request -- see
 # terminate() for why that is unconditional rather than best-effort.
@@ -69,25 +58,14 @@ class OutboxFull(RuntimeError):
     """The client stopped reading. Section 7's policy is to disconnect it."""
 
 
-# Section 8 input cap. RESERVED_FOR_RESPONSE guarantees room is left for the
-# model to ANSWER, not merely to fit the question -- without it a prompt could
-# legally consume the entire budget and leave nothing to reply with.
+# Section 8 input cap  [notes: session.(module)]
 RESERVED_FOR_RESPONSE = 256
 
 
 class Turn:
     """One complete exchange (user delta + generated response) in KV.
 
-    MUTABLE on purpose. Section 8's position-shift fix has to write corrected
-    positions back into entries still in the list; tuples cannot do that, and
-    the bug it fixes is precisely that other turns kept stale positions.
-
-    Range is [start, end): from the first token of the user delta to the last
-    token of the response. That boundary is not arbitrary -- every delta begins
-    with the terminator that CLOSES the preceding assistant block (a
-    consequence of section 6c deriving deltas from the template). So dropping a
-    whole exchange leaves the survivor's assistant block to be closed by the
-    NEXT surviving delta, and the result is well-formed with no repair step.
+    Rationale: implementation_notes.md, session.Turn
     """
 
     __slots__ = ("start", "end", "role", "msg_index")
@@ -105,10 +83,7 @@ class Turn:
 class Session:
     """One conversation, pinned to one KV slot.
 
-    Identity is (extension_id, tab_id, origin) -- origin included because
-    without it, navigating a tab from a bank site to another site let the new
-    site's content script inherit a session still holding the bank
-    conversation (section 5g).
+    Rationale: implementation_notes.md, session.Session
     """
 
     def __init__(self, key, slot, formatter, output_cap, session_budget=2048):
@@ -122,48 +97,27 @@ class Session:
         self.produced = 0                 # tokens emitted this response
         self.inbox_tokens = []            # prompt tokens awaiting prefill
         self.prefill_offset = 0
-        # PER-REQUEST, not per-session -- a correction to §7, which calls this
-        # "the session's outbox". Under §6b's single-flight replace TWO handlers
-        # are briefly alive: the superseded one waiting for its terminal frame,
-        # and the new one waiting for tokens. One shared queue means whichever
-        # polls first steals the other's frames -- the superseded client could
-        # receive the new response, or hang until its 60s read timeout. Each
-        # request gets its own queue; the engine writes to whichever is current.
+        # PER-REQUEST, not per-session -- a correction to §7, which calls...  [notes: session.Session.__init__]
         self.outbox = queue.Queue(maxsize=MAX_OUTBOX_TOKENS)
         self.pending_outbox = None
         self.streamer = Utf8Streamer()
         self.sampler = None               # per-session: see Engine._make_sampler
         self._reply_bytes = bytearray()   # what the model produced this turn
 
-        # Section 6b's TWO snapshots. One is not enough: pos_before_generation
-        # is right for interrupting a response already streaming, but a replace
-        # arriving DURING prefill of a large prompt has no earlier point to roll
-        # back to. Both are absolute positions, and section 8's compact() owns
-        # shifting them -- if that shift is ever skipped, rollback silently
-        # targets the wrong position.
+        # Section 6b's TWO snapshots  [notes: session.Session.__init__]
         self.pos_before_request = 0
         self.pos_before_generation = 0
-        # The formatter's matching checkpoint. Must be captured and restored at
-        # exactly the same moments as pos_before_request, or the two states
-        # diverge -- see ChatFormatter.checkpoint().
+        # The formatter's matching checkpoint  [notes: session.Session.__init__]
         self.formatter_cp_before_request = None
 
-        # Section 8: completed exchanges, oldest first. turn_boundaries[0] is
-        # the ANCHOR -- kept always, because it carries the template's one-time
-        # system/tools preamble and StreamingLLM's finding that the first ~32
-        # tokens act as attention anchors whose loss degrades output sharply.
+        # Section 8: completed exchanges, oldest first  [notes: session.Session.__init__]
         self.turn_boundaries = []
-        # Partitioned KV: the hard slice n_ctx/n_seq_max. Shared KV: a SOFTER
-        # cap (n_ctx/2 by default) -- the engine's aggregate guard is the real
-        # bound. Passed in from config so it tracks n_ctx / n_seq_max instead of
-        # a constant that silently goes stale when either changes.
+        # Partitioned KV  [notes: session.Session.__init__]
         self.budget = session_budget
 
         # §9a aging: consecutive rounds this session was passed over.
         self.rounds_excluded = 0
-        # §9b: consecutive rounds a PENDING session was skipped because the
-        # leftover budget could not fund a minimum-size chunk. Not in §9b --
-        # see build_batch for the starvation this prevents.
+        # §9b: consecutive rounds a PENDING session was skipped because th...  [notes: session.Session.__init__]
         self.prefill_stalls = 0
         # The token this session must decode next round. Set when sampled,
         # consumed when the next batch is composed.
@@ -183,11 +137,7 @@ class Session:
     def emit(self, frame_type, payload):
         """Queue one frame. Raises OutboxFull if the reader has stalled.
 
-        Section 7 considered three policies and only one is defensible:
-        blocking the engine stalls the single shared execution slot for every
-        other session over one slow reader; dropping tokens silently corrupts
-        the response with no indication; so a stalled reader is treated exactly
-        like a dead one and routed through the ordinary teardown path.
+        Rationale: implementation_notes.md, session.Session.emit
         """
         try:
             self.outbox.put_nowait((frame_type, payload))
@@ -197,12 +147,7 @@ class Session:
     def terminate(self, frame_type, payload=""):
         """Emit the single terminal frame, bypassing the queue bound if needed.
 
-        Section 10a rule 2: a cancelled request MUST produce a terminal frame.
-        Without one the browser waits out its 60s SO_RCVTIMEO instead of ending
-        promptly. That makes this the one emission that must not fail because
-        the queue is full -- the whole point is to unblock a stuck reader, so
-        the bound that protects against a stuck reader cannot be allowed to
-        prevent it.
+        Rationale: implementation_notes.md, session.Session.terminate
         """
         try:
             self.outbox.put_nowait((frame_type, payload))
@@ -217,8 +162,4 @@ class Session:
                 pass                              # reader is gone entirely
 
 
-# Section 5d: two sampling configs, deliberately separate rather than one shared
-# default. Canary/fidelity tests (§12 tests 1,4,18,27,32,40) assume deterministic
-# output -- with any randomness they become probabilistic rather than pass/fail.
-# Real chat must NOT be greedy: argmax produces flat, repetitive text. The GGUF
-# carries no sampling defaults (25 metadata keys scanned, none sampling-related),
+# Section 5d  [notes: session.(module)]

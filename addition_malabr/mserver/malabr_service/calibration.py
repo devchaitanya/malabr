@@ -1,23 +1,6 @@
 """Startup calibration -- see design_doc/phase1_design.md section 11a.
 
-Measures this machine rather than trusting numbers measured on another one.
-Every throughput figure in the design document was taken on one 8-logical /
-4-physical, 14 GB machine and does not transfer.
-
-The phases, and what each exists to defend against:
-  A  thread sizing            -- more threads than the quota allows is slower
-  B  position-cost curve      -- decode collapses with depth (48 -> 5 tok/s)
-  B-prefill  prefill curve    -- prefill is compute-bound, NOT the decode curve
-  C  joint worst case         -- per-session cost does not predict joint cost
-  D  finished tables + gate   -- engine never re-derives on the hot path
-  E  atomic store + fallback  -- an interrupted shutdown must not corrupt it
-  F  clamps on OWN output     -- calibration succeeding but returning nonsense
-  G  absolute ceiling         -- a corrupted curve must not lift the cap
-
-ONE curve captures both memory and CPU. Every decode step attends to every
-prior token; reading that token's K/V is what costs the bandwidth AND the
-space. They are two costs of the same growing quantity, position -- not two
-things that happen to correlate.
+Rationale: implementation_notes.md, calibration
 """
 
 import json
@@ -47,18 +30,12 @@ class CalibrationError(RuntimeError):
     pass
 
 
-# ---------------------------------------------------------------------------
-# low-level helpers -- every return code checked
-# ---------------------------------------------------------------------------
+# ----------------------------------------------------------------...  [notes: calibration._decode]
 
 def _decode(ctx, tokens, pos0, seq_ids, want_last_logits=True):
     """Decode `tokens` into every sequence in seq_ids at pos0..
 
-    Return codes are checked, not assumed. Section 11a records two separate
-    occasions where an unchecked llama_decode return produced a physically
-    impossible throughput number (41323 tok/s once, a negative switch cost
-    another time). A silent failure here would make calibration confidently
-    wrong, which is worse than calibration failing.
+    Rationale: implementation_notes.md, calibration._decode
     """
     n = len(tokens) * len(seq_ids)
     batch = C.llama_batch_init(n, 0, 1)
@@ -92,11 +69,7 @@ def _fill_to(ctx, vocab, seq, target_pos, chunk=256):
     return pos
 
 
-# Keyed by the vocab handle, not a bare global: a token id is only meaningful
-# for the vocabulary that produced it. One process only ever calibrates one
-# model today (a model switch re-execs), but a bare cache would silently hand a
-# second model the FIRST model's filler token and corrupt its curves with no
-# error -- the kind of assumption that should be enforced, not remembered.
+# Keyed by the vocab handle, not a bare global  [notes: calibration.(module)]
 _SAFE_TOKEN = {}
 
 
@@ -125,25 +98,18 @@ def _time_decode_tokens(ctx, vocab, seq, pos, n_tokens):
     return n_tokens / dt
 
 
-# ---------------------------------------------------------------------------
-# Phases
-# ---------------------------------------------------------------------------
+# ----------------------------------------------------------------...  [notes: calibration.phase_a_threads]
 
 def phase_a_threads(model_path, candidates=None, probe_tokens=24, n_ctx=1024):
     """Sweep n_threads and pick the measured optimum.
 
-    NOT the physical core count. Measured on the reference machine: 8 threads
-    is SLOWER than 4 (hyperthread contention, not parallelism), and the
-    deployed value must additionally match the cpu.max quota -- setting one
-    without the other is the nonlinear-loss regime section 11 measured.
+    Rationale: implementation_notes.md, calibration.phase_a_threads
     """
     cores = detect_physical_cores()
     if candidates is None:
         candidates = sorted({1, 2, 4, cores})
     results = {}
-    # n_threads is a CONTEXT parameter, so the model -- the expensive part, a
-    # full GGUF load -- is loaded once and only the context is rebuilt per
-    # candidate. Reloading the model each time did the same work 3-4x over.
+    # n_threads is a CONTEXT parameter, so the model -- the expensive...  [notes: calibration.phase_a_threads]
     mp = C.llama_model_default_params(); mp.n_gpu_layers = 0
     model = C.llama_model_load_from_file(model_path.encode(), mp)
     if not model:
@@ -182,15 +148,7 @@ def phase_b_position_curve(ctx, vocab, positions, trials=TRIALS_PER_POINT,
                            probe_tokens=16, seq=0):
     """Decode tok/s at several depths. Emits BOTH statistics.
 
-    Section 11a's rule, and the reason there are two: the median is
-    representative and feeds the output-cap formula; the WORST observed trial
-    feeds anything that is a hard cutoff, because the spread is real (19% at
-    short context, measured, not hypothetical). Using the median for admission
-    means a round estimated at 45ms can genuinely take 54ms.
-
-    Piecewise interpolation between real points, deliberately -- section 11a
-    tried fitting the closed-form "fixed weight-read + linear KV-read" model
-    and it does NOT hold (the slope of 1/tps is not monotonic in position).
+    Rationale: implementation_notes.md, calibration.phase_b_position_curve
     """
     rows = []
     mem = C.llama_get_memory(ctx)
@@ -198,11 +156,7 @@ def phase_b_position_curve(ctx, vocab, positions, trials=TRIALS_PER_POINT,
         _fill_to(ctx, vocab, seq, pos)
         samples = []
         for _ in range(trials):
-            # Truncate back to `pos` before EVERY trial. llama.cpp requires
-            # sequence positions to stay consecutive: the previous trial left
-            # the cache at pos+probe_tokens, so starting the next one at `pos`
-            # again fails with "it is required that the sequence positions
-            # remain consecutive". Cheaper than re-filling from zero.
+            # Truncate back to `pos` before EVERY trial  [notes: calibration.phase_b_position_curve]
             C.llama_memory_seq_rm(mem, seq, pos, -1)
             samples.append(_time_decode_tokens(ctx, vocab, seq, pos, probe_tokens))
         rows.append([int(pos),
@@ -215,12 +169,7 @@ def phase_b_position_curve(ctx, vocab, positions, trials=TRIALS_PER_POINT,
 def phase_b_prefill_curve(ctx, vocab, sizes, depths, trials=2, seq=1):
     """Prompt-processing throughput. A SEPARATE curve, not the decode one.
 
-    Decode is memory-bandwidth-bound: one token, but every prior K/V vector is
-    read. Prefill is compute-bound and parallel: many tokens in one pass
-    amortising the same weight read. Reusing the decode curve for prefill
-    admission would be wrong by roughly an order of magnitude.
-
-    Worst-observed, not median -- this feeds an admission cutoff (section 9b).
+    Rationale: implementation_notes.md, calibration.phase_b_prefill_curve
     """
     tok = _safe_token(vocab)
     rows = []
@@ -245,11 +194,7 @@ def phase_b_prefill_curve(ctx, vocab, sizes, depths, trials=2, seq=1):
 def phase_c_joint_worst_case(ctx, vocab, n_seq_max, depth, probe_tokens=8):
     """Every slot full, every session at depth, batched, under the real quota.
 
-    A REAL measurement, not an extrapolation from Phase B. Section 11a proved
-    extrapolation unreliable here, not merely theoretically risky: the naive
-    prediction was ~41 tok/s where the joint measurement gave 12.5 -- a 3x
-    error in the OPTIMISTIC direction. Per-session cost genuinely does not
-    predict joint cost, because the KV-read terms stack rather than share.
+    Rationale: implementation_notes.md, calibration.phase_c_joint_worst_case
     """
     seqs = list(range(n_seq_max))
     for s in seqs:
@@ -267,9 +212,7 @@ def phase_c_joint_worst_case(ctx, vocab, n_seq_max, depth, probe_tokens=8):
             "per_session_tps": (total / dt) / len(seqs)}
 
 
-# ---------------------------------------------------------------------------
-# Phase D -- finished tables and the validation gate
-# ---------------------------------------------------------------------------
+# ----------------------------------------------------------------...  [notes: calibration._interpolate]
 
 def _interpolate(rows, pos, col):
     lo = rows[0]
@@ -289,11 +232,7 @@ def derive_output_cap_table(decode_rows, min_cap, absolute_ceiling,
                             breakpoints=None):
     """FINISHED lookup table, not raw tok/s for someone else to interpret.
 
-    Section 12 test 31 checks exactly this: the engine reads the table and
-    never recomputes a cap from raw curve data on a request path.
-
-    Uses the MEDIAN column -- this is the representative estimate, not a
-    safety cutoff.
+    Rationale: implementation_notes.md, calibration.derive_output_cap_table
     """
     if breakpoints is None:
         breakpoints = [r[0] for r in decode_rows]
@@ -341,18 +280,12 @@ def phase_d_assemble(threads, decode_rows, prefill_rows, joint, n_ctx,
     }
 
 
-# ---------------------------------------------------------------------------
-# Phase F -- clamps on calibration's OWN output
-# ---------------------------------------------------------------------------
+# ----------------------------------------------------------------...  [notes: calibration.phase_f_clamp]
 
 def phase_f_clamp(result, min_cap, absolute_ceiling):
     """Distinct from Phase E, which covers calibration ERRORING.
 
-    This covers calibration SUCCEEDING and returning nonsense from an internal
-    bug -- n_threads=0, an absurd n_ctx, a negative tok/s. Different failure
-    class, different defense. Converts "trust calibration got it right" into
-    "trust calibration to optimise within bounds that hold even when it is
-    wrong", which is the property actually wanted.
+    Rationale: implementation_notes.md, calibration.phase_f_clamp
     """
     cores = detect_physical_cores()
     result["n_threads"] = max(1, min(int(result.get("n_threads") or 1), cores))
@@ -395,19 +328,12 @@ def phase_f_clamp(result, min_cap, absolute_ceiling):
     return result
 
 
-# ---------------------------------------------------------------------------
-# Phase E -- atomic store, and a fallback that treats corrupt as missing
-# ---------------------------------------------------------------------------
+# ----------------------------------------------------------------...  [notes: calibration.save]
 
 def save(result, path):
     """Write via temp file + rename. Atomic on the same filesystem.
 
-    Section 11a traced the real shutdown path: MalabrManager::StopMLServer
-    calls Terminate(0, false) -- SIGTERM, with wait=false, so the browser does
-    NOT confirm our handler finished. If the OS force-kills during a fast
-    logout mid-write, a plain write leaves a truncated file. This is the only
-    thing the design persists at all, so it is exactly the operation that race
-    can catch.
+    Rationale: implementation_notes.md, calibration.save
     """
     tmp = f"{path}.{os.getpid()}.tmp"
     directory = os.path.dirname(path) or "."
@@ -424,9 +350,7 @@ def save(result, path):
 def load(path):
     """Return a stored result, or None.
 
-    "Unparseable" is treated exactly like "missing" -- not as an error. A
-    truncated file from an interrupted shutdown must fall back to fresh
-    calibration, not crash the server on startup.
+    Rationale: implementation_notes.md, calibration.load
     """
     try:
         with open(path) as fh:
@@ -443,9 +367,7 @@ def load(path):
 def conservative_fallback(n_ctx, n_seq_max, min_cap, absolute_ceiling):
     """Phase E: what to use when calibration itself fails.
 
-    Deliberately pessimistic rather than a guess at typical hardware. Being
-    too conservative costs throughput; being optimistic breaks the latency
-    bound the whole scheduler exists to hold.
+    Rationale: implementation_notes.md, calibration.conservative_fallback
     """
     return {
         "version": CALIBRATION_VERSION,
@@ -453,9 +375,7 @@ def conservative_fallback(n_ctx, n_seq_max, min_cap, absolute_ceiling):
         "passed": False,
         "warnings": ["calibration failed; conservative fallback in use"],
         "n_threads": 1,
-        # Same SHAPE as a measured result, deliberately. A fallback that omits
-        # keys makes every consumer crash on the one path where things are
-        # already going wrong.
+        # Same SHAPE as a measured result, deliberately  [notes: calibration.conservative_fallback]
         "n_threads_detail": {"measured": {}, "fastest": 1, "chosen": 1,
                              "quota_threads": 1,
                              "physical_cores": detect_physical_cores()},
@@ -470,17 +390,12 @@ def conservative_fallback(n_ctx, n_seq_max, min_cap, absolute_ceiling):
     }
 
 
-# ---------------------------------------------------------------------------
-# Orchestration
-# ---------------------------------------------------------------------------
+# ----------------------------------------------------------------...  [notes: calibration.run]
 
 def run(cfg, min_cap, absolute_ceiling, quick=False, ctx=None, model=None):
     """Run every phase and return a clamped, ready-to-use result.
 
-    Never raises: a calibration failure falls back (Phase E) rather than
-    stopping the server. Section 11c's audit is explicit that isolation and
-    browser-protection do NOT depend on calibration -- only conversation
-    length and speed do -- so a fallback degrades quality, not safety.
+    Rationale: implementation_notes.md, calibration.run
     """
     budget = cfg.n_ctx_per_session
     if quick:
@@ -562,8 +477,7 @@ def load_or_run(cfg, min_cap, absolute_ceiling, quick=False, force=False):
 def apply_to_engine(result, engine, engine_module):
     """Hand the finished tables to the engine.
 
-    The engine holds these from startup and never re-derives them per round
-    (section 12 test 31).
+    Rationale: implementation_notes.md, calibration.apply_to_engine
     """
     engine.cost_curve = engine_module.CostCurve(
         decode_table=result.get("decode_curve") or None,
