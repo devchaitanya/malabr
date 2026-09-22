@@ -14,7 +14,6 @@ ROUTE_STOP = "ROUTE_MALABR_STOP"
 FRAME_TOKEN = 0
 FRAME_COMPLETE = 1
 FRAME_ERROR = 2
-TERMINAL_FRAMES = (FRAME_COMPLETE, FRAME_ERROR)
 
 # Matches kMaxFramePayload in mserver_uds.cc  [notes: protocol.(module)]
 MAX_FRAME_PAYLOAD = 1024 * 1024
@@ -167,21 +166,6 @@ def encode_frame(frame_type, payload):
     return struct.pack(">BI", frame_type, len(payload)) + payload
 
 
-def read_frame(conn):
-    """Read one response frame. Returns (type, payload) or None if closed.
-
-    Rationale: implementation_notes.md, protocol.read_frame
-    """
-    head = recv_full(conn, 5)
-    if head is None:
-        return None
-    frame_type, length = struct.unpack(">BI", head)
-    if length > MAX_FRAME_PAYLOAD:
-        raise ProtocolError(f"frame payload too large ({length})")
-    payload = recv_full(conn, length)
-    if payload is None:
-        return None
-    return frame_type, payload
 
 
 # ----------------------------------------------------------------...  [notes: protocol.(module)]

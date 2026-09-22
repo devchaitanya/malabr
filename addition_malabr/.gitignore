@@ -8,3 +8,6 @@ __pycache__
 models/
 # working notes, kept local
 design_doc/
+
+# measured on this machine at first start; not portable
+mserver/calibration.json

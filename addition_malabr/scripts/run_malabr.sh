@@ -136,6 +136,8 @@ CHROME_ARGS=(
 )
 
 if [[ -n "$EXTENSION_DIR" ]]; then
+  # Absolute, because the launch below cd's to the repo root.
+  EXTENSION_DIR="$(cd "$EXTENSION_DIR" && pwd)"
   CHROME_ARGS+=("--load-extension=${EXTENSION_DIR}")
 fi
 if [[ "${NO_SANDBOX:-0}" == "1" ]]; then
@@ -247,4 +249,8 @@ fi
 
 echo "recorded to ${RUN_LOG}"
 echo "launching..."
+# MalabrManager resolves addition_malabr/mserver/app.py relative to chrome's
+# working directory, so launch from the repo root whatever directory this
+# script was invoked from.
+cd "$REPO_ROOT"
 exec "$CHROME_BIN" "${CHROME_ARGS[@]}"
