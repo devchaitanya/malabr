@@ -189,6 +189,10 @@
 
   function save() {
     sessReady((s) => {
+      // Last 40 turns only: chrome.storage.session has a ~10MB quota shared by
+      // the whole extension, and a turn can carry a page-sized reply. Older
+      // turns stop persisting across reloads; the server's KV still has them
+      // until compaction, so nothing the model knows is lost, only the display.
       try { s.set({ [KEY]: transcript.slice(-40) }); } catch (e) {}
     });
   }
@@ -590,9 +594,15 @@
     const typed = ta.value.trim();
     if (!typed) return;
     if (/^\/bench\b/.test(typed)) {
+      // Same single-generation rule as a normal turn: a benchmark runs two
+      // full generations back to back, and an Enter meanwhile must not open a
+      // parallel one. Held via `sending` for the whole run.
+      if (inFlight || sending) return;
+      sending = true;
       ta.value = ""; ta.style.height = "auto";
       render("you", typed);
-      bench(typed.replace(/^\/bench\b\s*/, "") || null);
+      bench(typed.replace(/^\/bench\b\s*/, "") || null)
+        .finally(() => { sending = false; });
       return;
     }
     if (inFlight || sending) {
@@ -689,6 +699,15 @@
   });
 
   restore();
-  refreshModels();
+  // The server may still be loading its model when the panel appears (cold
+  // start, or MalabrManager just spawned it). A single failed list would leave
+  // the model picker empty for the life of the tab, so retry with backoff
+  // until it answers -- bounded, and only until the first success.
+  (async function primeModels(tries) {
+    for (let i = 0; i < tries; i++) {
+      if (await refreshModels()) return;
+      await new Promise((r) => setTimeout(r, Math.min(1500 * (i + 1), 8000)));
+    }
+  })(20);
   ta.focus();
 })();
