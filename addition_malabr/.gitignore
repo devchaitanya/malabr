@@ -6,3 +6,5 @@ __pycache__
 
 # Model weight artifacts (GBs, downloadable separately — never commit to git)
 models/
+# working notes, kept local
+design_doc/
